@@ -90,10 +90,11 @@ VOICE_HOTKEY_PRESETS = {
 
 # These values were shipped by earlier Windows builds. They are reserved
 # built-ins rather than user customizations, so config migration may replace
-# either spelling with the current physical shortcut.
-LEGACY_VOICE_HOTKEYS = frozenset(
-    {"ralt", "ralt+space", "lctrl+win", "lctrl+lwin"}
-)
+# either spelling with the current physical shortcut. Ctrl+Win is deliberately
+# NOT reserved any more: it was the former HOLD preset, but voice hotkeys are
+# now fully configurable, so a user who chooses it must not have it rewritten
+# back to right-Alt on load.
+LEGACY_VOICE_HOTKEYS = frozenset({"ralt", "ralt+space"})
 
 
 # Exact old Windows chords that were previously presented as the reference

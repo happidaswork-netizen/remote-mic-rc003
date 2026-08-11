@@ -68,7 +68,25 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             loaded = config.load_config(path)
         self.assertEqual(loaded["voice_hotkey"], "win+h")
 
-    def test_load_repairs_recorded_left_ctrl_win_to_hold_mode(self):
+    def test_load_preserves_a_user_chosen_left_ctrl_win_hold_shortcut(self):
+        # Ctrl+Win was the old built-in HOLD preset, but hotkeys are now fully
+        # configurable - a user who chooses it must not have it rewritten back
+        # to right-Alt on load.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {"voice_trigger_mode": "hold", "voice_hotkey": "lctrl+lwin"}
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+        self.assertEqual(loaded["voice_trigger_mode"], "hold")
+        self.assertEqual(loaded["voice_hotkey"], "lctrl+lwin")
+
+    def test_load_repairs_a_stale_toggle_mode_left_ctrl_win_to_hold(self):
+        # Ctrl+Win is a hold chord; a stale toggle record is repaired to hold,
+        # but the user's chosen chord itself is preserved, not rewritten.
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text(
@@ -79,7 +97,17 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             )
             loaded = config.load_config(path)
         self.assertEqual(loaded["voice_trigger_mode"], "hold")
-        self.assertEqual(loaded["voice_hotkey"], "ralt")
+        self.assertEqual(loaded["voice_hotkey"], "lctrl+lwin")
+
+    def test_save_preserves_a_user_chosen_left_ctrl_win_hold_shortcut(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            data = config.default_config()
+            data.update({"voice_trigger_mode": "hold", "voice_hotkey": "lctrl+lwin"})
+            config.save_config(path, data)
+            loaded = config.load_config(path)
+        self.assertEqual(loaded["voice_trigger_mode"], "hold")
+        self.assertEqual(loaded["voice_hotkey"], "lctrl+lwin")
 
     def test_load_repairs_recorded_left_alt_to_right_alt_in_hold_mode(self):
         with tempfile.TemporaryDirectory() as tmp:

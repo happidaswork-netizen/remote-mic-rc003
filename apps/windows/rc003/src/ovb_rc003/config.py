@@ -146,23 +146,14 @@ def save_config(path: Path, config: Dict[str, Any]) -> None:
 def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
     """Keep the two built-in voice modes paired with their real shortcuts.
 
-    Legacy built-in values are repaired, and a recorded built-in chord also
-    restores its required mode if the UI previously saved the two fields out
-    of sync. A user-supplied shortcut such as ``win+h`` remains untouched.
+    Only the current right-Alt built-ins (``ralt`` / ``ralt+space``) are
+    auto-repaired when saved out of sync with their mode. Any other recorded
+    chord - including the former Ctrl+Win HOLD preset, now a legitimate user
+    choice - is preserved, with its required mode inferred when possible.
     """
 
     current = str(config.get("voice_hotkey", "")).strip().lower()
     from . import key_mapping
-
-    # The former HOLD preset was Ctrl+Win. It is a shipped built-in, not a
-    # user customization: migrate it to the right-Alt physical bridge and
-    # repair the mode even if the two old fields were saved out of sync.
-    if current in {"lctrl+win", "lctrl+lwin"}:
-        config["voice_trigger_mode"] = key_mapping.VoiceTriggerMode.HOLD.value
-        config["voice_hotkey"] = key_mapping.voice_hotkey_for_trigger_mode(
-            key_mapping.VoiceTriggerMode.HOLD
-        )
-        return
 
     try:
         mode = key_mapping.VoiceTriggerMode(config.get("voice_trigger_mode"))
