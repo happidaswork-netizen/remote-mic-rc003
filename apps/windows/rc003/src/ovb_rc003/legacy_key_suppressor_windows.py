@@ -21,7 +21,7 @@ import threading
 import time
 from ctypes import wintypes
 from dataclasses import dataclass
-from typing import Callable, FrozenSet, List, NamedTuple, Optional, Tuple
+from typing import Callable, FrozenSet, Iterable, List, NamedTuple, Optional, Tuple
 
 
 WH_KEYBOARD_LL = 13
@@ -115,8 +115,17 @@ class LegacyKeySuppressor:
         *,
         rc003_vk_codes: Optional[FrozenSet[int]] = None,
         consume_wait_seconds: float = 0.060,
+        physicalize_vk_codes: Iterable[int] = (0xA5,),
     ) -> None:
         self._suppress_vk_codes: FrozenSet[int] = frozenset(int(vk) for vk in suppress_vk_codes)
+        # Voice edges the bridge injects carry LLKHF_INJECTED plus
+        # VOICE_EVENT_EXTRA_INFO. Doubao discards synthetic keyboard events, so
+        # this hook strips the injected marker from exactly these vk codes
+        # (the configured voice hotkey) before Doubao's downstream hook sees
+        # them. Upstream defaulted to right-Alt, the built-in HOLD preset.
+        self._physicalize_vk_codes: FrozenSet[int] = frozenset(
+            int(vk) for vk in physicalize_vk_codes
+        )
         self._on_key_event = on_key_event
         self._on_key_transform = on_key_transform
         # Production callers can replace a swallowed physical edge with a
@@ -166,7 +175,7 @@ class LegacyKeySuppressor:
 
         if not (int(event.flags) & LLKHF_INJECTED):
             return False
-        if int(event.vkCode) != 0xA5:
+        if int(event.vkCode) not in self._physicalize_vk_codes:
             return False
         if int(event.dwExtraInfo) != VOICE_EVENT_EXTRA_INFO:
             return False

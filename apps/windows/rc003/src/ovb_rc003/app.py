@@ -261,6 +261,7 @@ class RC003App:
             on_key_transform=self._transform_legacy_voice_key,
             on_key_emit=self._emit_legacy_voice_key,
             rc003_vk_codes=frozenset(raw_input_windows.KEYBOARD_VK_TO_BUTTON),
+            physicalize_vk_codes=frozenset(self._voice_hotkey_vk_codes()),
         )
         try:
             self._legacy_key_suppressor.start()

@@ -480,6 +480,31 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertEqual(calls, [])
         self.assertTrue(self.app._voice.active)
 
+    def test_suppressor_physicalizes_configured_hotkey_vks(self):
+        # app.py wires the suppressor with the configured voice hotkey's vk
+        # codes so the injected Ctrl+Win edge is stripped of LLKHF_INJECTED
+        # before Doubao's downstream hook sees it (Doubao discards synthetic
+        # keyboard events). The default right-Alt physicalize alone would never
+        # touch a Ctrl+Win chord.
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
+        gate = app_module.legacy_key_suppressor_windows.LegacyKeySuppressor(
+            {0x74},
+            physicalize_vk_codes=frozenset(self.app._voice_hotkey_vk_codes()),
+        )
+        for vk_code in (0xA2, 0x5B):
+            event = app_module.legacy_key_suppressor_windows.KBDLLHOOKSTRUCT(
+                vkCode=vk_code,
+                scanCode=0,
+                flags=app_module.legacy_key_suppressor_windows.LLKHF_INJECTED,
+                time=123,
+                dwExtraInfo=(
+                    app_module.legacy_key_suppressor_windows.VOICE_EVENT_EXTRA_INFO
+                ),
+            )
+            self.assertTrue(gate.physicalize_injected_event(event))
+            self.assertEqual(event.flags, 0)
+            self.assertEqual(event.dwExtraInfo, 0)
+
     def test_hold_preset_maps_f5_to_configured_hotkey_target(self):
         self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
         self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
