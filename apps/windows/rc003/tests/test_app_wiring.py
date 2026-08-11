@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -176,6 +177,7 @@ class _AppWiringTestCase(unittest.TestCase):
         # test's temp config dir (a ResourceWarning/flakiness risk under
         # -W error::ResourceWarning).
         self.app._cancel_legacy_f5_timeout()
+        self.app._cancel_hold_watchdog()
         # XRBM-023: logging_setup.get_logger() configures its FileHandler
         # exactly once per process (module-global ``_configured``) and never
         # closes it - correct for a real long-running app, but in this suite
@@ -368,6 +370,114 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             win32_input.send_voice_key_combo_tap = original
 
         self.assertEqual(calls, [("ralt", "space"), ("ralt", "space")])
+        self.assertTrue(self.app._voice.active)
+
+    # -- force-release on BLE disconnect / held-hotkey watchdog -------------
+
+    def test_disconnect_force_releases_stuck_hold_hotkey(self):
+        # A HOLD session is stuck open: key-down already injected via the
+        # transform path, but the physical F5 key-up AND the AudioStopped edge
+        # were both lost (BLE drop mid press) - Ctrl+Win is logically held in
+        # the OS. Reconnect must not run until that held key is released.
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
+        self.app._voice.on_mic_button_pressed()
+        self.app._voice_legacy_transform_session = True
+        self.app._voice_legacy_transform_key_down = True
+        self.assertTrue(self.app._voice.active)
+        reconnect_calls = []
+        self.app._supervisor.request_reconnect = lambda: reconnect_calls.append(True)
+        calls = []
+        original = win32_input.send_voice_key_combo_up
+        win32_input.send_voice_key_combo_up = lambda tokens: calls.append(tokens)
+        try:
+            self.app._on_disconnected()
+        finally:
+            win32_input.send_voice_key_combo_up = original
+
+        self.assertEqual(calls, [("lctrl", "lwin")])
+        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_legacy_transform_key_down)
+        self.assertEqual(reconnect_calls, [True])
+
+    def test_disconnect_force_releases_toggle_active_session(self):
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("ralt+space")
+        self.app._voice.on_mic_button_pressed()
+        self.assertTrue(self.app._voice.active)
+        reconnect_calls = []
+        self.app._supervisor.request_reconnect = lambda: reconnect_calls.append(True)
+        calls = []
+        original = win32_input.send_voice_key_combo_tap
+        win32_input.send_voice_key_combo_tap = lambda tokens: calls.append(tokens)
+        try:
+            self.app._on_disconnected()
+        finally:
+            win32_input.send_voice_key_combo_tap = original
+
+        self.assertEqual(calls, [("ralt", "space")])
+        self.assertFalse(self.app._voice.active)
+        self.assertEqual(reconnect_calls, [True])
+
+    def test_disconnect_without_active_session_does_not_inject(self):
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
+        self.assertFalse(self.app._voice.active)
+        reconnect_calls = []
+        self.app._supervisor.request_reconnect = lambda: reconnect_calls.append(True)
+        calls = []
+        original = win32_input.send_voice_key_combo_up
+        win32_input.send_voice_key_combo_up = lambda tokens: calls.append(tokens)
+        try:
+            self.app._on_disconnected()
+        finally:
+            win32_input.send_voice_key_combo_up = original
+
+        self.assertEqual(calls, [])
+        self.assertEqual(reconnect_calls, [True])
+
+    def test_hold_watchdog_trips_and_force_releases_after_idle(self):
+        # The key-up edge was lost AND the session went quiet: no audio pokes
+        # keep the watchdog alive, so it must force-release the held hotkey.
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
+        self.app._voice.on_mic_button_pressed()
+        self.assertTrue(self.app._voice.active)
+        self.app._hold_watchdog_timeout = 0.05
+        calls = []
+        original = win32_input.send_voice_key_combo_up
+        win32_input.send_voice_key_combo_up = lambda tokens: calls.append(tokens)
+        try:
+            self.app._arm_hold_watchdog()
+            deadline = time.monotonic() + 1.0
+            while not calls and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            win32_input.send_voice_key_combo_up = original
+            self.app._cancel_hold_watchdog()
+
+        self.assertEqual(calls, [("lctrl", "lwin")])
+        self.assertFalse(self.app._voice.active)
+
+    def test_hold_watchdog_poked_by_audio_does_not_trip(self):
+        # An actively-streaming session must never trip the watchdog: every
+        # audio frame re-pokes it, so a normal long dictation stays held.
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
+        self.app._voice.on_mic_button_pressed()
+        self.app._hold_watchdog_timeout = 0.05
+        calls = []
+        original = win32_input.send_voice_key_combo_up
+        win32_input.send_voice_key_combo_up = lambda tokens: calls.append(tokens)
+        try:
+            self.app._arm_hold_watchdog()
+            for _ in range(15):
+                time.sleep(0.01)
+                self.app._on_pcm_frame([0, 0])
+        finally:
+            win32_input.send_voice_key_combo_up = original
+            self.app._cancel_hold_watchdog()
+
+        self.assertEqual(calls, [])
         self.assertTrue(self.app._voice.active)
 
     def test_hold_preset_maps_f5_to_configured_hotkey_target(self):

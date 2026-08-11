@@ -119,6 +119,13 @@ class RC003App:
         self._voice_audio_start_fallback_pending = False
         self._voice_audio_started_waiting_for_legacy_f5 = False
         self._voice_legacy_f5_timeout: Optional[threading.Timer] = None
+        # HOLD watchdog: a key-down is normally released by the physical F5
+        # key-up or the AudioStopped edge. If both are lost (BLE drop mid
+        # press), the injected Ctrl+Win stays logically held; this timer
+        # force-releases it after the hotkey has sat idle with no audio and no
+        # key-up. Poked by every audio sample so a live session never trips it.
+        self._voice_hold_watchdog: Optional[threading.Timer] = None
+        self._hold_watchdog_timeout = 5.0
         # Raw Input and the ATVV control channel arrive on different worker
         # threads. Serialize the voice state machine so one physical press
         # cannot race into two host shortcut deliveries.
@@ -404,6 +411,7 @@ class RC003App:
                 self._voice_audio_start_fallback_pending = False
                 self._voice_audio_started_waiting_for_legacy_f5 = False
                 self._cancel_legacy_f5_timeout()
+                self._cancel_hold_watchdog()
                 self._voice_raw_input_trigger_pending = False
                 reset_action = self._voice.reset()
                 if reset_action is not None and not self._apply_voice_action(reset_action):
@@ -478,10 +486,26 @@ class RC003App:
     # -- disconnect / error callbacks: hand off to the supervisor ----------
 
     def _on_disconnected(self) -> None:
+        # A BLE drop mid-session can lose both the physical F5 key-up and the
+        # AudioStopped edge, leaving the injected hotkey logically held in the
+        # OS. Reconnect alone never sends the compensating key-up, so release
+        # before the retry loop starts.
+        with self._voice_trigger_lock:
+            if self._voice.active or self._voice_legacy_transform_key_down:
+                self._release_voice_hotkey()
+                self._logger.info(
+                    "voice hotkey force-released after BLE disconnect"
+                )
         self._logger.info("BLE reported disconnected; requesting reconnect")
         self._supervisor.request_reconnect()
 
     def _on_session_error(self, exc: BaseException) -> None:
+        with self._voice_trigger_lock:
+            if self._voice.active or self._voice_legacy_transform_key_down:
+                self._release_voice_hotkey()
+                self._logger.info(
+                    "voice hotkey force-released after ATVV session error"
+                )
         self._logger.info("ATVV protocol error, requesting reconnect: %s", exc)
         self._supervisor.request_reconnect()
 
@@ -519,8 +543,10 @@ class RC003App:
             tokens = self._voice_hotkey_tokens()
             if is_pressed:
                 win32_input.send_voice_key_combo_down(tokens)
+                self._arm_hold_watchdog()
             else:
                 win32_input.send_voice_key_combo_up(tokens)
+                self._cancel_hold_watchdog()
             self._voice_legacy_transform_emitted = True
             self._logger.info(
                 "voice physical F5 replaced with one configured voice hotkey edge via %s: %s",
@@ -655,6 +681,67 @@ class RC003App:
                 "voice legacy F5 never arrived; falling back to configured voice hotkey"
             )
             self._handle_mic_button_pressed(send_device_open=False)
+
+    def _arm_hold_watchdog(self) -> None:
+        """Arm the HOLD force-release watchdog for the injected key-down.
+
+        Only HOLD paths arm it (transform down and KEY_DOWN), never TOGGLE,
+        whose open-until-next-tap state is legitimately idle.
+        """
+
+        self._cancel_hold_watchdog()
+        timer = threading.Timer(
+            self._hold_watchdog_timeout, self._voice_hold_watchdog_fire
+        )
+        timer.daemon = True
+        self._voice_hold_watchdog = timer
+        timer.start()
+
+    def _cancel_hold_watchdog(self) -> None:
+        timer = self._voice_hold_watchdog
+        self._voice_hold_watchdog = None
+        if timer is not None:
+            timer.cancel()
+
+    def _poke_hold_watchdog(self) -> None:
+        """Reset the watchdog while audio is still streaming."""
+        if self._voice.active:
+            self._arm_hold_watchdog()
+
+    def _voice_hold_watchdog_fire(self) -> None:
+        with self._voice_trigger_lock:
+            if not self._voice.active and not self._voice_legacy_transform_key_down:
+                return
+            self._logger.info(
+                "voice hold watchdog tripped: session idle %.0fs with no key-up; force-releasing",
+                self._hold_watchdog_timeout,
+            )
+            self._release_voice_hotkey()
+
+    def _release_voice_hotkey(self) -> None:
+        """Force-release a logically held voice hotkey (caller holds the lock).
+
+        Releases through the state machine when it owes a closing action
+        (HOLD's KEY_UP / TOGGLE's closing TAP), then unconditionally lifts any
+        transform down that may still be physically injected.
+        """
+
+        self._cancel_hold_watchdog()
+        reset_action = self._voice.reset()
+        if reset_action is not None:
+            self._apply_voice_action(reset_action)
+        if self._voice_legacy_transform_key_down:
+            try:
+                win32_input.send_voice_key_combo_up(self._voice_hotkey_tokens())
+                self._logger.info(
+                    "voice force-released transform-down hotkey edge"
+                )
+            except (win32_input.Win32InputUnavailableError, OSError):
+                self._logger.exception("voice force-release of transform-down hotkey failed")
+        self._voice_legacy_transform_key_down = False
+        self._voice_legacy_transform_session = False
+        self._voice_legacy_transform_emitted = False
+        self._legacy_f5_is_down = False
 
     def _on_raw_input_event(self, event: raw_input_windows.RawInputEvent) -> None:
         """Arm the exact original keyboard edge for duplicate suppression.
@@ -1071,6 +1158,7 @@ class RC003App:
                     win32_input.send_voice_key_combo_up(self._voice_hotkey_tokens())
                     self._voice_legacy_transform_key_down = False
                     self._voice_legacy_transform_session = False
+                    self._cancel_hold_watchdog()
                     self._logger.info(
                         "voice released configured-hotkey replacement before physical F5 key-up"
                     )
@@ -1091,10 +1179,13 @@ class RC003App:
         try:
             if action == voice_controller.VoiceHostAction.TAP:
                 win32_input.send_voice_key_combo_tap(tokens)
+                self._cancel_hold_watchdog()
             elif action == voice_controller.VoiceHostAction.KEY_DOWN:
                 win32_input.send_voice_key_combo_down(tokens)
+                self._arm_hold_watchdog()
             else:
                 win32_input.send_voice_key_combo_up(tokens)
+                self._cancel_hold_watchdog()
             return True
         except win32_input.Win32InputUnavailableError:
             self._logger.info("voice hotkey action skipped: no usable voice input backend")
@@ -1152,6 +1243,7 @@ class RC003App:
             return
         try:
             self._voice_pcm_stats.add(samples)
+            self._poke_hold_watchdog()
             if self._voice_pcm_stats.frames in (1, 10) or self._voice_pcm_stats.frames % 200 == 0:
                 stats = self._voice_pcm_stats.summary()
                 self._logger.info(
