@@ -269,7 +269,7 @@ class RC003App:
                 self._logger.info(
                     "startup: RC003 F5 voice edge transforms to the configured voice hotkey"
                 )
-                if doubao_rpc.start_physicalizer():
+                if doubao_rpc.start_physicalizer(self._voice_hotkey_vk_codes()):
                     self._logger.info(
                         "startup: Doubao low-level voice event physicalizer enabled"
                     )
@@ -649,6 +649,15 @@ class RC003App:
         """
 
         return win32_keys.resolve_vk_codes(self._voice_hotkey_tokens())[-1]
+
+    def _voice_hotkey_vk_codes(self) -> tuple:
+        """Return the configured voice hotkey's full virtual-key code list.
+
+        Every key in the chord (modifiers plus trigger) needs its injected
+        marker cleared for the host voice app; a modifier alone is not enough.
+        """
+
+        return tuple(win32_keys.resolve_vk_codes(self._voice_hotkey_tokens()))
 
     def _arm_legacy_f5_timeout(self) -> None:
         """Arm a short fallback that emits the voice hotkey if the physical

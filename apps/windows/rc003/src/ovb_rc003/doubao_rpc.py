@@ -26,22 +26,34 @@ _IME_SERVICE_NAME = "ImeService.exe"
 _IME_SERVICE_CALLBACK_RVA = 0x726740
 _IME_SERVICE_SHA256 = "8c51f6e78953598e75a89574ddb49a0fb78d3fa2bae8229290fcf1706274aedf"
 
-_PHYSICALIZER_SOURCE = r"""
+def _physicalizer_source(vk_codes: Tuple[int, ...]) -> str:
+    """Return the Frida script that strips Doubao's injected-event marker.
+
+    Doubao ignores Win32 synthetic key events (``LLKHF_INJECTED``).  The
+    script hooks ImeService.exe's keyboard callback and clears that marker
+    only for the configured voice hotkey's virtual keys, so the injected edge
+    looks physical to Doubao.  The callback address, marker offset and module
+    hash match the verified DoubaoIME build (see ``_IME_SERVICE_SHA256``).
+    """
+
+    codes_literal = ", ".join(f"0x{int(code):X}" for code in vk_codes)
+    return f"""\
 const module = Process.getModuleByName('ImeService.exe');
 const callback = module.base.add(0x726740);
-send({type: 'ready', callback: callback.toString()});
-Interceptor.attach(callback, {
-  onEnter(args) {
+send({{type: 'ready', callback: callback.toString()}});
+const targetVks = new Set([{codes_literal}]);
+Interceptor.attach(callback, {{
+  onEnter(args) {{
     if (args[0].toInt32() < 0) return;
     const event = args[2];
     const vk = event.readU32();
     const flags = event.add(8).readU32();
-    if (vk === 0xA5 && (flags & 0x10) !== 0) {
+    if (targetVks.has(vk) && (flags & 0x10) !== 0) {{
       event.add(8).writeU32(flags & ~0x12);
       event.add(16).writeU64(0);
-    }
-  }
-});
+    }}
+  }}
+}});
 """
 
 
@@ -133,7 +145,7 @@ class DoubaoPhysicalizer:
             except Exception:
                 pass
 
-    def start(self) -> bool:
+    def start(self, vk_codes: Tuple[int, ...] = (0xA5,)) -> bool:
         with self._lock:
             if self._script is not None and self._session is not None:
                 return True
@@ -167,7 +179,7 @@ class DoubaoPhysicalizer:
                             raise RuntimeError(
                                 "ImeService.exe path or SHA-256 does not match the verified build"
                             )
-                        script = session.create_script(_PHYSICALIZER_SOURCE)
+                        script = session.create_script(_physicalizer_source(vk_codes))
                         script.load()
                         self._frida = frida
                         self._session = session
@@ -207,10 +219,10 @@ class DoubaoPhysicalizer:
 _physicalizer = DoubaoPhysicalizer()
 
 
-def start_physicalizer() -> bool:
+def start_physicalizer(vk_codes: Tuple[int, ...] = (0xA5,)) -> bool:
     """Install the verified in-process Doubao callback filter if possible."""
 
-    return _physicalizer.start()
+    return _physicalizer.start(vk_codes)
 
 
 def stop_physicalizer() -> None:

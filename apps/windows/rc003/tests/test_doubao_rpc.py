@@ -84,13 +84,21 @@ class DoubaoRpcTests(unittest.TestCase):
 
 
 class DoubaoPhysicalizerTests(unittest.TestCase):
-    def test_script_only_clears_marked_right_alt_in_doubao_callback(self):
-        source = doubao_rpc._PHYSICALIZER_SOURCE
+    def test_script_clears_marker_only_for_configured_hotkey_vks(self):
+        source = doubao_rpc._physicalizer_source((0xA2, 0x5B))
 
-        self.assertIn("vk === 0xA5", source)
+        # Both the modifier and the trigger key of the configured chord get
+        # the injected marker stripped; no right-Alt hardcoding remains.
+        self.assertIn("0xA2", source)
+        self.assertIn("0x5B", source)
+        self.assertNotIn("0xA5", source)
         self.assertIn("flags & 0x10", source)
         self.assertIn("flags & ~0x12", source)
         self.assertIn("event.add(16).writeU64(0)", source)
+
+    def test_script_defaults_to_right_alt(self):
+        source = doubao_rpc._physicalizer_source((0xA5,))
+        self.assertIn("0xA5", source)
 
     def test_verified_module_requires_the_installed_doubao_path_and_hash(self):
         with mock.patch.object(
@@ -132,11 +140,14 @@ class DoubaoPhysicalizerTests(unittest.TestCase):
         ), mock.patch.object(
             physicalizer, "_verify_module", return_value=True
         ):
-            self.assertTrue(physicalizer.start())
+            self.assertTrue(physicalizer.start((0xA2, 0x5B)))
 
         self.assertEqual(physicalizer.status, "active")
         script.load.assert_called_once()
         fake_frida.attach.assert_called_once_with(46500)
+        source = session.create_script.call_args[0][0]
+        self.assertIn("0xA2", source)
+        self.assertIn("0x5B", source)
         physicalizer.stop()
         script.unload.assert_called_once()
         session.detach.assert_called_once()
