@@ -118,16 +118,17 @@ class RC003App:
         self._voice_hotkey = hotkey.HotkeySpec.parse(self._config["voice_hotkey"])
         self._voice_audio_start_fallback_pending = False
         self._voice_audio_started_waiting_for_legacy_f5 = False
+        self._voice_legacy_f5_timeout: Optional[threading.Timer] = None
         # Raw Input and the ATVV control channel arrive on different worker
         # threads. Serialize the voice state machine so one physical press
         # cannot race into two host shortcut deliveries.
         self._voice_trigger_lock = threading.Lock()
         self._voice_raw_input_trigger_pending = False
         # When the built-in HOLD shortcut is selected, the low-level F5 hook
-        # can deliver one right-Alt edge through the physicalized low-level
-        # hook path. Keep this separate from VoiceController's logical state so
-        # the normal audio/ATVV lifecycle still deduplicates correctly without
-        # sending a second host shortcut.
+        # can deliver one configured voice-hotkey edge through the physicalized
+        # low-level hook path. Keep this separate from VoiceController's
+        # logical state so the normal audio/ATVV lifecycle still deduplicates
+        # correctly without sending a second host shortcut.
         self._voice_legacy_transform_key_down = False
         self._voice_legacy_transform_session = False
         self._voice_legacy_transform_emitted = False
@@ -245,9 +246,8 @@ class RC003App:
 
         # RC003's voice key is reported by Windows' keyboard class as F5 as
         # well as through ATVV. Raw Input is preferred when available; this
-        # narrowly intercepts the same legacy F5 leak and emits one marked
-        # right-Alt edge before audio starts. Doubao's own callback then
-        # physicalizes that marked edge.
+        # narrowly intercepts the same legacy F5 leak and emits one configured
+        # voice-hotkey edge before audio starts.
         self._legacy_key_suppressor = legacy_key_suppressor_windows.LegacyKeySuppressor(
             {0x74},
             on_key_event=self._on_legacy_key_event,
@@ -260,7 +260,7 @@ class RC003App:
             self._logger.info("startup: RC003 voice legacy-key guard enabled")
             if self._legacy_voice_transform_enabled():
                 self._logger.info(
-                    "startup: RC003 F5 voice edge transforms to one physical right-Alt edge"
+                    "startup: RC003 F5 voice edge transforms to the configured voice hotkey"
                 )
                 if doubao_rpc.start_physicalizer():
                     self._logger.info(
@@ -403,6 +403,7 @@ class RC003App:
             with self._voice_trigger_lock:
                 self._voice_audio_start_fallback_pending = False
                 self._voice_audio_started_waiting_for_legacy_f5 = False
+                self._cancel_legacy_f5_timeout()
                 self._voice_raw_input_trigger_pending = False
                 reset_action = self._voice.reset()
                 if reset_action is not None and not self._apply_voice_action(reset_action):
@@ -485,41 +486,44 @@ class RC003App:
         self._supervisor.request_reconnect()
 
     def _legacy_voice_transform_enabled(self) -> bool:
-        """Whether the selected HOLD preset uses the physical right-Alt path."""
+        """Whether HOLD mode swallows the physical F5 and emits the configured
+        voice hotkey instead.
 
-        return self._voice.trigger_mode == key_mapping.VoiceTriggerMode.HOLD and (
-            self._voice_hotkey.serialize() in {"ralt", "lctrl+win", "lctrl+lwin"}
-        )
+        Any HOLD-mode hotkey takes the transform path: the RC003 F5 is always
+        replaced with the configured shortcut, so a custom key such as ``f8``
+        no longer leaks F5 to the foreground app. TOGGLE mode drives the
+        shortcut directly from the ATVV control channel and never uses this
+        path.
+        """
+
+        return self._voice.trigger_mode == key_mapping.VoiceTriggerMode.HOLD
 
     def _emit_legacy_voice_key(
         self,
         target: legacy_key_suppressor_windows.PhysicalKeyTarget,
         is_pressed: bool,
     ) -> bool:
-        """Emit exactly one right-Alt edge for a physical F5 edge.
+        """Emit exactly one configured voice-hotkey edge for a physical F5 edge.
 
         The original F5 is swallowed by ``LegacyKeySuppressor``. This callback
-        emits the single marked right-Alt edge for Doubao's verified callback
-        physicalizer. No second host shortcut is sent for this session.
+        emits the single configured voice-hotkey edge (``voice_hotkey``) so
+        the foreground voice app sees the configured shortcut instead of a
+        browser-refreshing F5. No second host shortcut is sent for this
+        session.
         """
 
-        expected = legacy_key_suppressor_windows.PhysicalKeyTarget(
-            vk_code=0xA5,
-            scan_code=0x38,
-            extended=True,
-            system_key=True,
-        )
-        if target != expected:
+        if int(target.vk_code) != self._voice_hotkey_vk():
             self._voice_legacy_transform_emitted = False
             return False
         try:
+            tokens = self._voice_hotkey_tokens()
             if is_pressed:
-                win32_input.send_voice_key_combo_down(("ralt",))
+                win32_input.send_voice_key_combo_down(tokens)
             else:
-                win32_input.send_voice_key_combo_up(("ralt",))
+                win32_input.send_voice_key_combo_up(tokens)
             self._voice_legacy_transform_emitted = True
             self._logger.info(
-                "voice physical F5 replaced with one right-Alt edge via %s: %s",
+                "voice physical F5 replaced with one configured voice hotkey edge via %s: %s",
                 win32_input.voice_backend_name(),
                 "down" if is_pressed else "up",
             )
@@ -529,14 +533,14 @@ class RC003App:
             if is_pressed:
                 self._voice_legacy_transform_key_down = False
             self._logger.exception(
-                "voice physical right-Alt replacement failed; using host fallback"
+                "voice configured-hotkey replacement failed; using host fallback"
             )
             return False
 
     def _transform_legacy_voice_key(
         self, vk_code: int, is_pressed: bool
     ) -> Optional[legacy_key_suppressor_windows.PhysicalKeyTarget]:
-        """Replace a physical RC003 F5 edge with one physical right-Alt edge.
+        """Replace a physical RC003 F5 edge with one configured voice-hotkey edge.
 
         The callback runs inside the low-level hook.  It deliberately only
         arms a new down edge while no voice trigger is already in flight; a
@@ -561,10 +565,10 @@ class RC003App:
         else:
             self._voice_legacy_transform_key_down = False
         return legacy_key_suppressor_windows.PhysicalKeyTarget(
-            vk_code=0xA5,
-            scan_code=0x38,
-            extended=True,
-            system_key=True,
+            vk_code=self._voice_hotkey_vk(),
+            scan_code=0,
+            extended=False,
+            system_key=False,
         )
 
     def _on_legacy_key_event(self, vk_code: int, is_pressed: bool) -> None:
@@ -605,6 +609,52 @@ class RC003App:
                 host_action_handled=host_action_handled,
             )
             self._voice_legacy_transform_emitted = False
+
+    def _voice_hotkey_tokens(self) -> tuple:
+        """Return the configured voice hotkey as an ordered token sequence."""
+
+        return tuple(self._voice_hotkey.modifiers) + (self._voice_hotkey.key,)
+
+    def _voice_hotkey_vk(self) -> int:
+        """Return the configured voice hotkey's final (trigger) virtual-key code.
+
+        Resolved on demand so a test or future runtime change of
+        ``self._voice_hotkey`` is always reflected here.
+        """
+
+        return win32_keys.resolve_vk_codes(self._voice_hotkey_tokens())[-1]
+
+    def _arm_legacy_f5_timeout(self) -> None:
+        """Arm a short fallback that emits the voice hotkey if the physical
+        F5 edge never arrives.
+
+        The HOLD path normally waits for the remote's leaked F5 to emit the
+        host shortcut. When that edge is lost (a BLE hiccup during the
+        press), waiting forever leaves voice dead; fall back to emitting the
+        configured hotkey directly after a short window instead.
+        """
+
+        self._cancel_legacy_f5_timeout()
+        timer = threading.Timer(0.4, self._legacy_f5_timeout_fire)
+        timer.daemon = True
+        self._voice_legacy_f5_timeout = timer
+        timer.start()
+
+    def _cancel_legacy_f5_timeout(self) -> None:
+        timer = self._voice_legacy_f5_timeout
+        self._voice_legacy_f5_timeout = None
+        if timer is not None:
+            timer.cancel()
+
+    def _legacy_f5_timeout_fire(self) -> None:
+        with self._voice_trigger_lock:
+            if not self._voice_audio_started_waiting_for_legacy_f5:
+                return
+            self._voice_audio_started_waiting_for_legacy_f5 = False
+            self._logger.info(
+                "voice legacy F5 never arrived; falling back to configured voice hotkey"
+            )
+            self._handle_mic_button_pressed(send_device_open=False)
 
     def _on_raw_input_event(self, event: raw_input_windows.RawInputEvent) -> None:
         """Arm the exact original keyboard edge for duplicate suppression.
@@ -853,6 +903,7 @@ class RC003App:
                             "voice mic trigger received from ATVV; waiting for physical F5"
                         )
                         self._voice_audio_started_waiting_for_legacy_f5 = True
+                        self._arm_legacy_f5_timeout()
                         self._open_playback_for_new_session()
                     else:
                         self._logger.info("voice mic trigger received from ATVV control channel")
@@ -868,6 +919,7 @@ class RC003App:
                             "voice audio started before F5; waiting for physical mic edge"
                         )
                         self._voice_audio_started_waiting_for_legacy_f5 = True
+                        self._arm_legacy_f5_timeout()
                         self._open_playback_for_new_session()
                     else:
                         self._logger.info("voice audio start used as microphone trigger")
@@ -895,6 +947,7 @@ class RC003App:
                 )
                 self._voice_audio_start_fallback_pending = False
                 self._voice_audio_started_waiting_for_legacy_f5 = False
+                self._cancel_legacy_f5_timeout()
                 self._voice_raw_input_trigger_pending = False
                 action = self._voice.on_audio_stopped()
                 transformed_session = self._voice_legacy_transform_session
@@ -943,6 +996,7 @@ class RC003App:
             return
 
         self._voice_audio_started_waiting_for_legacy_f5 = False
+        self._cancel_legacy_f5_timeout()
 
         if not self._open_playback_for_new_session():
             self._logger.info(
@@ -958,7 +1012,7 @@ class RC003App:
         )
         if host_action_handled:
             self._logger.info(
-                "voice host shortcut already handled by physical F5-to-right-Alt transform"
+                "voice host shortcut already handled by physical F5-to-configured-hotkey transform"
             )
         if not action_delivered:
             # Nothing physically landed (win32_input.py's own batching
@@ -975,21 +1029,22 @@ class RC003App:
             self._ble_session.send_mic_open_threadsafe()
 
     def _apply_voice_action(self, action: voice_controller.VoiceHostAction) -> bool:
-        tokens = tuple(self._voice_hotkey.modifiers) + (self._voice_hotkey.key,)
+        tokens = self._voice_hotkey_tokens()
         if self._voice_legacy_transform_session:
             if (
                 action == voice_controller.VoiceHostAction.KEY_UP
                 and self._voice_legacy_transform_key_down
             ):
                 # Audio can stop before the remote's leaked F5 key-up arrives.
-                # Release the replacement right-Alt edge here so a disconnect
-                # or early stream stop can never leave Alt logically held.
+                # Release the replacement voice hotkey edge here so a
+                # disconnect or early stream stop can never leave the key
+                # logically held.
                 try:
-                    win32_input.send_voice_key_combo_up(("ralt",))
+                    win32_input.send_voice_key_combo_up(self._voice_hotkey_tokens())
                     self._voice_legacy_transform_key_down = False
                     self._voice_legacy_transform_session = False
                     self._logger.info(
-                        "voice released right-Alt replacement before physical F5 key-up"
+                        "voice released configured-hotkey replacement before physical F5 key-up"
                     )
                     return True
                 except (
@@ -997,11 +1052,11 @@ class RC003App:
                     OSError,
                 ):
                     self._logger.exception(
-                        "voice right-Alt replacement release failed"
+                        "voice configured-hotkey replacement release failed"
                     )
                     return False
             self._logger.info(
-                "voice host action already delivered by physical F5-to-right-Alt transform: %s",
+                "voice host action already delivered by physical F5-to-configured-hotkey transform: %s",
                 action.value,
             )
             return True

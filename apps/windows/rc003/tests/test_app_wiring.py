@@ -168,6 +168,14 @@ class _AppWiringTestCase(unittest.TestCase):
         self.app._ble_session = _FakeBleSession()
 
     def tearDown(self):
+        # Cancel the HOLD-mode legacy-F5 fallback timer before the test ends:
+        # if a test drove AudioStarted/MicButtonPressed and then stopped
+        # without the physical F5 edge ever arriving, the 0.4s daemon timer
+        # would fire _legacy_f5_timeout_fire() AFTER this test - opening a
+        # real playback sink / touching the Windows audio API from a dead
+        # test's temp config dir (a ResourceWarning/flakiness risk under
+        # -W error::ResourceWarning).
+        self.app._cancel_legacy_f5_timeout()
         # XRBM-023: logging_setup.get_logger() configures its FileHandler
         # exactly once per process (module-global ``_configured``) and never
         # closes it - correct for a real long-running app, but in this suite
@@ -295,15 +303,25 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertTrue(self.app._voice.active)
         self.assertTrue(self.app._voice_legacy_transform_session)
 
-    def test_hold_preset_maps_f5_to_one_right_alt_down_and_up_target(self):
+    def test_hold_preset_maps_f5_to_configured_hotkey_target(self):
         self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
         self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
 
         down = self.app._transform_legacy_voice_key(0x74, True)
         up = self.app._transform_legacy_voice_key(0x74, False)
 
-        self.assertEqual(down, app_module.legacy_key_suppressor_windows.PhysicalKeyTarget(0xA5, 0x38, True, True))
-        self.assertEqual(up, app_module.legacy_key_suppressor_windows.PhysicalKeyTarget(0xA5, 0x38, True, True))
+        self.assertEqual(
+            down,
+            app_module.legacy_key_suppressor_windows.PhysicalKeyTarget(
+                0x5B, 0, False, False
+            ),
+        )
+        self.assertEqual(
+            up,
+            app_module.legacy_key_suppressor_windows.PhysicalKeyTarget(
+                0x5B, 0, False, False
+            ),
+        )
         self.assertFalse(self.app._voice_legacy_transform_key_down)
 
     def test_transformed_f5_edge_emits_one_right_alt_virtual_key_edge(self):

@@ -79,8 +79,8 @@ def default_config() -> Dict[str, Any]:
         # RC003's upstream decoder applies a 10 dB speech gain before the
         # 16 kHz PCM is sent to the virtual microphone.
         "gain_db": 10.0,
-        "retry_delay": 5.0,
-        "max_retry_delay": 60.0,
+        "retry_delay": 2.0,
+        "max_retry_delay": 15.0,
         "voice_shortcut_enabled": True,
         "voice_hotkey": key_mapping.voice_hotkey_for_trigger_mode(
             key_mapping.VoiceTriggerMode.TOGGLE
