@@ -733,10 +733,38 @@ class RC003App:
                 return
             with self._voice_trigger_lock:
                 if self._voice.active:
-                    self._logger.info(
-                        "voice physical trigger ignored: voice session already active"
-                    )
-                    return
+                    if self._voice_legacy_transform_key_down:
+                        # This F5 edge already delivered the configured voice
+                        # hotkey down through the low-level-hook transform
+                        # path; the session it opened is exactly the one now
+                        # active. This is the same press's late duplicate -
+                        # ignore it and let the matching physical F5 up run the
+                        # normal release instead of interrupting the key-down
+                        # it just emitted.
+                        self._logger.info(
+                            "voice physical trigger ignored: session already active "
+                            "on a transformed edge"
+                        )
+                        return
+                    # A previous voice session is still open: the ATVV audio
+                    # event arrived first and the physical F5 edge was lost
+                    # (the 0.4s fallback already opened the session), or the
+                    # prior AUDIO_STOP never arrived so ``active`` is stuck.
+                    # Swallowing would leave this press - and every press until
+                    # the session clears - completely unresponsive. Force the
+                    # previous session closed (KEY_UP for HOLD, closing TAP for
+                    # TOGGLE) and reopen as a fresh trigger so each press still
+                    # has a full effect.
+                    closing = self._voice.reset()
+                    if closing is not None:
+                        self._apply_voice_action(closing)
+                        self._logger.info(
+                            "voice overlapping trigger: closed previous session (%s), reopening",
+                            closing.value,
+                        )
+                    self._voice_legacy_transform_session = False
+                    self._voice_legacy_transform_emitted = False
+                    self._voice_raw_input_trigger_pending = False
                 if self._voice_raw_input_trigger_pending:
                     self._logger.info(
                         "voice physical trigger ignored: trigger already in progress"

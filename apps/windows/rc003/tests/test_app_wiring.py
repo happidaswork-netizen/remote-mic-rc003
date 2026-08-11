@@ -303,6 +303,73 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertTrue(self.app._voice.active)
         self.assertTrue(self.app._voice_legacy_transform_session)
 
+    def test_overlapping_mic_press_closes_stuck_session_and_reopens(self):
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
+        # A previous session is stuck open (its AUDIO_STOP never arrived, or
+        # the legacy-F5 fallback already opened it) - the controller still
+        # thinks a key-down is outstanding. A new press must force that
+        # session closed and reopen as a fresh trigger, not be silently
+        # dropped (that silent drop is what made repeated presses feel dead).
+        self.app._voice.on_mic_button_pressed()
+        self.assertTrue(self.app._voice.active)
+        calls = []
+        original_down = win32_input.send_voice_key_combo_down
+        original_up = win32_input.send_voice_key_combo_up
+        win32_input.send_voice_key_combo_down = lambda tokens: calls.append(("down", tokens))
+        win32_input.send_voice_key_combo_up = lambda tokens: calls.append(("up", tokens))
+        try:
+            self.app._on_button_event("mic", True)
+        finally:
+            win32_input.send_voice_key_combo_down = original_down
+            win32_input.send_voice_key_combo_up = original_up
+
+        self.assertEqual(
+            calls, [("up", ("lctrl", "lwin")), ("down", ("lctrl", "lwin"))]
+        )
+        self.assertTrue(self.app._voice.active)
+
+    def test_overlapping_mic_press_ignored_while_transformed_edge_in_flight(self):
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
+        # The transform path already emitted the configured-hotkey down for
+        # this physical press and opened the active session. A second edge for
+        # the SAME press must not close+reopen and interrupt the key-down it
+        # just emitted - that would restart voice typing mid-press.
+        self.app._voice.on_mic_button_pressed()
+        self.app._voice_legacy_transform_key_down = True
+        calls = []
+        original_down = win32_input.send_voice_key_combo_down
+        original_up = win32_input.send_voice_key_combo_up
+        win32_input.send_voice_key_combo_down = lambda tokens: calls.append(("down", tokens))
+        win32_input.send_voice_key_combo_up = lambda tokens: calls.append(("up", tokens))
+        try:
+            self.app._on_button_event("mic", True)
+        finally:
+            win32_input.send_voice_key_combo_down = original_down
+            win32_input.send_voice_key_combo_up = original_up
+
+        self.assertEqual(calls, [])
+        self.assertTrue(self.app._voice.active)
+
+    def test_overlapping_toggle_mic_press_closes_and_reopens_toggle(self):
+        # TOGGLE mode: a stuck session owes a closing tap. The overlapping
+        # press must close it (TAP) and reopen (TAP) so the host toggle is
+        # left on, exactly as if the two presses had happened in order.
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("ralt+space")
+        self.app._voice.on_mic_button_pressed()
+        self.assertTrue(self.app._voice.active)
+        calls = []
+        original = win32_input.send_voice_key_combo_tap
+        win32_input.send_voice_key_combo_tap = lambda tokens: calls.append(tokens)
+        try:
+            self.app._on_button_event("mic", True)
+        finally:
+            win32_input.send_voice_key_combo_tap = original
+
+        self.assertEqual(calls, [("ralt", "space"), ("ralt", "space")])
+        self.assertTrue(self.app._voice.active)
+
     def test_hold_preset_maps_f5_to_configured_hotkey_target(self):
         self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
         self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
