@@ -292,6 +292,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
     def test_physical_legacy_f5_transform_skips_a_second_host_shortcut(self):
         self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
         self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
+        self.app._voice_audio_started_waiting_for_legacy_f5 = True
         self.app._voice_legacy_transform_key_down = True
         hotkey_calls = []
         original = win32_input.send_voice_key_combo_down
@@ -305,6 +306,45 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertTrue(self.app._voice.active)
         self.assertTrue(self.app._voice_legacy_transform_session)
 
+    def test_physical_f5_cancels_audio_started_host_fallback(self):
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
+        self.app._voice_audio_started_waiting_for_legacy_f5 = True
+        self.app._voice_legacy_transform_key_down = True
+
+        class PendingFallback:
+            cancelled = False
+
+            def cancel(self):
+                self.cancelled = True
+
+        fallback = PendingFallback()
+        self.app._voice_legacy_f5_timeout = fallback
+        trigger_calls = []
+        original = self.app._handle_mic_button_pressed
+
+        def record_trigger(**kwargs):
+            trigger_calls.append(kwargs)
+            return original(**kwargs)
+
+        self.app._handle_mic_button_pressed = record_trigger
+        try:
+            self.app._on_legacy_key_event(0x74, True)
+            # Simulate a cancelled Timer callback that was already queued. It
+            # must see the cleared latch and remain inert.
+            self.app._legacy_f5_timeout_fire()
+        finally:
+            self.app._handle_mic_button_pressed = original
+
+        self.assertTrue(fallback.cancelled)
+        self.assertIsNone(self.app._voice_legacy_f5_timeout)
+        self.assertFalse(self.app._voice_audio_started_waiting_for_legacy_f5)
+        self.assertEqual(
+            trigger_calls,
+            [{"send_device_open": False, "host_action_handled": True}],
+        )
+        self.assertTrue(self.app._voice.active)
+
     def test_overlapping_mic_press_closes_stuck_session_and_reopens(self):
         self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
         self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
@@ -315,6 +355,9 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         # dropped (that silent drop is what made repeated presses feel dead).
         self.app._voice.on_mic_button_pressed()
         self.assertTrue(self.app._voice.active)
+        # A new ATVV session, rather than an uncorrelated trailing HID F5,
+        # authorizes recovery from the previous stuck logical hold.
+        self.app._voice_audio_started_waiting_for_legacy_f5 = True
         calls = []
         original_down = win32_input.send_voice_key_combo_down
         original_up = win32_input.send_voice_key_combo_up
@@ -330,6 +373,74 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             calls, [("up", ("lctrl", "lwin")), ("down", ("lctrl", "lwin"))]
         )
         self.assertTrue(self.app._voice.active)
+
+    def test_hold_orphan_f5_after_audio_stop_cannot_rehold_hotkey(self):
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
+        calls = []
+        original_down = win32_input.send_voice_key_combo_down
+        original_up = win32_input.send_voice_key_combo_up
+        win32_input.send_voice_key_combo_down = lambda tokens: calls.append(("down", tokens))
+        win32_input.send_voice_key_combo_up = lambda tokens: calls.append(("up", tokens))
+        try:
+            # Normal session: ATVV arrives first, then its correlated F5 edge.
+            self.app._on_control_event(AudioStarted(session_id=31, reason=0x03))
+            target = self.app._transform_legacy_voice_key(0x74, True)
+            self.assertIsNotNone(target)
+            self.assertTrue(self.app._emit_legacy_voice_key(target, True))
+            self.app._on_legacy_key_event(0x74, True)
+            self.assertTrue(self.app._voice.active)
+
+            # AUDIO_STOP releases the configured chord before the HID up edge.
+            self.app._on_control_event(AudioStopped(reason=0x02))
+            self.assertFalse(self.app._voice.active)
+            self.assertFalse(self.app._voice_legacy_transform_key_down)
+            self.app._on_legacy_key_event(0x74, False)
+
+            # The real-device defect: a delayed down-only F5 must be swallowed,
+            # with no fresh Ctrl+Win down and no watchdog-owned active session.
+            self.assertIsNone(self.app._transform_legacy_voice_key(0x74, True))
+            self.app._on_legacy_key_event(0x74, True)
+        finally:
+            win32_input.send_voice_key_combo_down = original_down
+            win32_input.send_voice_key_combo_up = original_up
+
+        self.assertEqual(
+            calls,
+            [("down", ("lctrl", "lwin")), ("up", ("lctrl", "lwin"))],
+        )
+        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_legacy_transform_key_down)
+        self.assertIsNone(self.app._voice_hold_watchdog)
+
+    def test_hold_new_atvv_session_rearms_f5_after_orphan_was_ignored(self):
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
+
+        # Consume a complete orphan edge so the next session starts from the
+        # same key state Windows would have after eventually delivering F5-up.
+        self.app._on_legacy_key_event(0x74, True)
+        self.app._on_legacy_key_event(0x74, False)
+        self.app._on_control_event(AudioStarted(session_id=32, reason=0x03))
+
+        target = self.app._transform_legacy_voice_key(0x74, True)
+        self.assertIsNotNone(target)
+
+    def test_audio_stop_releases_transform_down_before_controller_activation(self):
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
+        self.app._voice_legacy_transform_key_down = True
+        calls = []
+        original_up = win32_input.send_voice_key_combo_up
+        win32_input.send_voice_key_combo_up = lambda tokens: calls.append(tokens)
+        try:
+            self.app._on_control_event(AudioStopped(reason=0x02))
+        finally:
+            win32_input.send_voice_key_combo_up = original_up
+
+        self.assertEqual(calls, [("lctrl", "lwin")])
+        self.assertFalse(self.app._voice_legacy_transform_key_down)
+        self.assertFalse(self.app._voice.active)
 
     def test_overlapping_mic_press_ignored_while_transformed_edge_in_flight(self):
         self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
@@ -458,6 +569,57 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertEqual(calls, [("lctrl", "lwin")])
         self.assertFalse(self.app._voice.active)
 
+    def test_hold_watchdog_clears_pending_trigger_without_rearming_f5_repeat(self):
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
+        self.app._voice.on_mic_button_pressed()
+        self.app._voice_legacy_transform_session = True
+        self.app._voice_legacy_transform_key_down = True
+        self.app._legacy_f5_is_down = True
+        self.app._voice_raw_input_trigger_pending = True
+        self.app._voice_audio_start_fallback_pending = True
+        self.app._voice_audio_started_waiting_for_legacy_f5 = True
+
+        class PendingFallback:
+            cancelled = False
+
+            def cancel(self):
+                self.cancelled = True
+
+        fallback = PendingFallback()
+        self.app._voice_legacy_f5_timeout = fallback
+        up_calls = []
+        original_up = win32_input.send_voice_key_combo_up
+        win32_input.send_voice_key_combo_up = lambda tokens: up_calls.append(tokens)
+        try:
+            with self.app._voice_trigger_lock:
+                self.app._release_voice_hotkey()
+        finally:
+            win32_input.send_voice_key_combo_up = original_up
+
+        self.assertEqual(up_calls, [("lctrl", "lwin")])
+        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_raw_input_trigger_pending)
+        self.assertFalse(self.app._voice_audio_start_fallback_pending)
+        self.assertFalse(self.app._voice_audio_started_waiting_for_legacy_f5)
+        self.assertIsNone(self.app._voice_legacy_f5_timeout)
+        self.assertTrue(fallback.cancelled)
+        # The physical key is still down, so its auto-repeat must remain
+        # collapsed until the matching real key-up arrives.
+        self.assertTrue(self.app._legacy_f5_is_down)
+
+        edges = []
+        original_button_event = self.app._on_button_event
+        self.app._on_button_event = lambda *args, **kwargs: edges.append(args[:2])
+        try:
+            self.app._on_legacy_key_event(0x74, True)   # held-key auto-repeat
+            self.app._on_legacy_key_event(0x74, False)  # real release
+            self.app._on_legacy_key_event(0x74, True)   # next genuine press
+        finally:
+            self.app._on_button_event = original_button_event
+
+        self.assertEqual(edges, [("mic", False), ("mic", True)])
+
     def test_hold_watchdog_poked_by_audio_does_not_trip(self):
         # An actively-streaming session must never trip the watchdog: every
         # audio frame re-pokes it, so a normal long dictation stays held.
@@ -480,9 +642,35 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertEqual(calls, [])
         self.assertTrue(self.app._voice.active)
 
+    def test_suppressor_physicalizes_configured_hotkey_vks(self):
+        # app.py wires the suppressor with the configured voice hotkey's vk
+        # codes so the injected Ctrl+Win edge is stripped of LLKHF_INJECTED
+        # before Doubao's downstream hook sees it (Doubao discards synthetic
+        # keyboard events). The default right-Alt physicalize alone would never
+        # touch a Ctrl+Win chord.
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
+        gate = app_module.legacy_key_suppressor_windows.LegacyKeySuppressor(
+            {0x74},
+            physicalize_vk_codes=frozenset(self.app._voice_hotkey_vk_codes()),
+        )
+        for vk_code in (0xA2, 0x5B):
+            event = app_module.legacy_key_suppressor_windows.KBDLLHOOKSTRUCT(
+                vkCode=vk_code,
+                scanCode=0,
+                flags=app_module.legacy_key_suppressor_windows.LLKHF_INJECTED,
+                time=123,
+                dwExtraInfo=(
+                    app_module.legacy_key_suppressor_windows.VOICE_EVENT_EXTRA_INFO
+                ),
+            )
+            self.assertTrue(gate.physicalize_injected_event(event))
+            self.assertEqual(event.flags, 0)
+            self.assertEqual(event.dwExtraInfo, 0)
+
     def test_hold_preset_maps_f5_to_configured_hotkey_target(self):
         self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
         self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
+        self.app._voice_audio_started_waiting_for_legacy_f5 = True
 
         down = self.app._transform_legacy_voice_key(0x74, True)
         up = self.app._transform_legacy_voice_key(0x74, False)

@@ -63,10 +63,12 @@ from . import (
     audio_output,
     audio_playback,
     action_executor,
+    atvv_protocol,
     ble_transport_winrt,
     button_gesture,
     config,
     connection_supervisor,
+    doubao_elevation_windows,
     doubao_rpc,
     frida_compat,
     hid_identity,
@@ -125,7 +127,11 @@ class RC003App:
         # force-releases it after the hotkey has sat idle with no audio and no
         # key-up. Poked by every audio sample so a live session never trips it.
         self._voice_hold_watchdog: Optional[threading.Timer] = None
-        self._hold_watchdog_timeout = 5.0
+        # Once audio stops arriving, a lost F5-up/AudioStopped edge must not
+        # leave Ctrl/Win logically held long enough to lock the user's normal
+        # keyboard. Live speech pokes this timer for every PCM frame, so the
+        # shorter idle timeout does not cap normal dictation duration.
+        self._hold_watchdog_timeout = 1.5
         # Raw Input and the ATVV control channel arrive on different worker
         # threads. Serialize the voice state machine so one physical press
         # cannot race into two host shortcut deliveries.
@@ -261,6 +267,7 @@ class RC003App:
             on_key_transform=self._transform_legacy_voice_key,
             on_key_emit=self._emit_legacy_voice_key,
             rc003_vk_codes=frozenset(raw_input_windows.KEYBOARD_VK_TO_BUTTON),
+            physicalize_vk_codes=frozenset(self._voice_hotkey_vk_codes()),
         )
         try:
             self._legacy_key_suppressor.start()
@@ -269,14 +276,30 @@ class RC003App:
                 self._logger.info(
                     "startup: RC003 F5 voice edge transforms to the configured voice hotkey"
                 )
-                if doubao_rpc.start_physicalizer():
+                physicalizer_ready = doubao_rpc.start_physicalizer(
+                    self._voice_hotkey_vk_codes()
+                )
+                if not physicalizer_ready:
+                    self._logger.info(
+                        "startup: requesting narrow administrator approval for "
+                        "the Doubao-only physicalizer helper"
+                    )
+                    physicalizer_ready = (
+                        doubao_elevation_windows.ensure_elevated_physicalizer(
+                            self._voice_hotkey_vk_codes()
+                        )
+                    )
+                if physicalizer_ready:
                     self._logger.info(
                         "startup: Doubao low-level voice event physicalizer enabled"
                     )
                 else:
                     self._logger.warning(
-                        "startup: Doubao voice physicalizer unavailable: %s",
-                        doubao_rpc.physicalizer_error() or doubao_rpc.physicalizer_status(),
+                        "startup: Doubao voice physicalizer unavailable: direct=%s; "
+                        "elevated-helper=%s",
+                        doubao_rpc.physicalizer_error()
+                        or doubao_rpc.physicalizer_status(),
+                        doubao_elevation_windows.elevation_error() or "unavailable",
                     )
         except legacy_key_suppressor_windows.LegacyKeySuppressorUnavailableError as exc:
             self._logger.warning("startup: RC003 voice legacy-key guard unavailable: %s", exc)
@@ -568,16 +591,20 @@ class RC003App:
     ) -> Optional[legacy_key_suppressor_windows.PhysicalKeyTarget]:
         """Replace a physical RC003 F5 edge with one configured voice-hotkey edge.
 
-        The callback runs inside the low-level hook.  It deliberately only
-        arms a new down edge while no voice trigger is already in flight; a
-        matching up edge is still transformed after the app has marked the
-        session active.  This prevents a Raw Input duplicate from opening a
-        second host shortcut while preserving the hold/release pair.
+        The callback runs inside the low-level hook.  A down edge is eligible
+        only while the ATVV control channel is waiting for the physical edge
+        of that same audio session.  Real RC003/Windows traces show that the
+        HID interface can emit a second, down-only F5 shortly *after*
+        AUDIO_STOP; transforming that orphan would press Ctrl+Win again after
+        the real session had already released it.  A matching up edge is still
+        transformed after the app has marked the session active.
         """
 
         if vk_code != 0x74 or not self._legacy_voice_transform_enabled():
             return None
         if is_pressed:
+            if not self._voice_audio_started_waiting_for_legacy_f5:
+                return None
             if (
                 self._voice.active
                 or self._voice_raw_input_trigger_pending
@@ -616,6 +643,20 @@ class RC003App:
                 if self._legacy_f5_is_down:
                     return
                 self._legacy_f5_is_down = True
+                # AUDIO_STARTED can beat the physical F5 edge and arm the
+                # 0.4-second host fallback.  Once this real edge arrives, the
+                # transformed hotkey already owns activation for this press;
+                # leaving the fallback armed makes it fire a second host
+                # shortcut shortly afterwards.  Clear/cancel it under the
+                # same lock used by the timer callback, then route the F5
+                # normally after releasing the non-reentrant lock.
+                with self._voice_trigger_lock:
+                    if self._voice_audio_started_waiting_for_legacy_f5:
+                        self._voice_audio_started_waiting_for_legacy_f5 = False
+                        self._cancel_legacy_f5_timeout()
+                        self._logger.info(
+                            "voice physical F5 arrived; canceled pending host fallback"
+                        )
                 self._logger.info(
                     "voice legacy F5 trigger received from low-level keyboard hook"
                 )
@@ -649,6 +690,15 @@ class RC003App:
         """
 
         return win32_keys.resolve_vk_codes(self._voice_hotkey_tokens())[-1]
+
+    def _voice_hotkey_vk_codes(self) -> tuple:
+        """Return the configured voice hotkey's full virtual-key code list.
+
+        Every key in the chord (modifiers plus trigger) needs its injected
+        marker cleared for the host voice app; a modifier alone is not enough.
+        """
+
+        return tuple(win32_keys.resolve_vk_codes(self._voice_hotkey_tokens()))
 
     def _arm_legacy_f5_timeout(self) -> None:
         """Arm a short fallback that emits the voice hotkey if the physical
@@ -723,10 +773,18 @@ class RC003App:
 
         Releases through the state machine when it owes a closing action
         (HOLD's KEY_UP / TOGGLE's closing TAP), then unconditionally lifts any
-        transform down that may still be physically injected.
+        transform down that may still be physically injected.  Every pending
+        trigger latch is cleared as part of the same transaction so a failed
+        press that never receives AudioStarted/MicButtonPressed cannot leave
+        all later microphone presses stuck behind "trigger already in
+        progress".
         """
 
         self._cancel_hold_watchdog()
+        self._voice_audio_start_fallback_pending = False
+        self._voice_audio_started_waiting_for_legacy_f5 = False
+        self._cancel_legacy_f5_timeout()
+        self._voice_raw_input_trigger_pending = False
         reset_action = self._voice.reset()
         if reset_action is not None:
             self._apply_voice_action(reset_action)
@@ -741,7 +799,12 @@ class RC003App:
         self._voice_legacy_transform_key_down = False
         self._voice_legacy_transform_session = False
         self._voice_legacy_transform_emitted = False
-        self._legacy_f5_is_down = False
+        # Do not clear _legacy_f5_is_down here.  A watchdog can fire while the
+        # physical remote key is still held; forgetting that edge makes its
+        # next Windows auto-repeat look like a brand-new press.  The real F5-up
+        # clears this latch in _on_legacy_key_event.  Full connection cleanup
+        # stops the hook and explicitly clears it when an up edge may have
+        # been lost altogether.
 
     def _on_raw_input_event(self, event: raw_input_windows.RawInputEvent) -> None:
         """Arm the exact original keyboard edge for duplicate suppression.
@@ -819,6 +882,24 @@ class RC003App:
             if not is_pressed:
                 return
             with self._voice_trigger_lock:
+                if (
+                    self._legacy_voice_transform_enabled()
+                    and not self._voice_audio_started_waiting_for_legacy_f5
+                    and not host_action_handled
+                    and not self._voice_legacy_transform_key_down
+                ):
+                    # ATVV is the authoritative microphone lifecycle.  The
+                    # RC003's Windows HID surface occasionally delivers a
+                    # delayed, down-only F5 after AUDIO_STOP.  Treating that
+                    # orphan as a fresh press re-held Ctrl+Win until the
+                    # watchdog fired.  A genuine next press receives a new
+                    # AUDIO_STARTED/MIC_BUTTON event and re-arms this path; if
+                    # its F5 happened to arrive first, the existing short ATVV
+                    # fallback still activates the configured hotkey.
+                    self._logger.info(
+                        "voice orphan physical mic down ignored: no ATVV session awaiting F5"
+                    )
+                    return
                 if self._voice.active:
                     if self._voice_legacy_transform_key_down:
                         # This F5 edge already delivered the configured voice
@@ -1025,7 +1106,11 @@ class RC003App:
                         self._handle_mic_button_pressed()
         elif isinstance(event, AudioStarted):
             with self._voice_trigger_lock:
-                self._logger.info("voice audio started")
+                self._logger.info(
+                    "voice audio started: reason=%s stream_id=%s",
+                    atvv_protocol.audio_start_reason_name(event.reason),
+                    "none" if event.session_id is None else event.session_id,
+                )
                 self._voice_pcm_stats.reset()
                 self._voice_audio_start_fallback_pending = False
                 if not self._voice.active:
@@ -1042,7 +1127,11 @@ class RC003App:
                         self._voice_audio_start_fallback_pending = self._voice.active
         elif isinstance(event, AudioStopped):
             with self._voice_trigger_lock:
-                self._logger.info("voice audio stopped")
+                self._logger.info(
+                    "voice audio stopped: reason=%s raw=%s",
+                    atvv_protocol.audio_stop_reason_name(event.reason),
+                    "none" if event.reason is None else f"0x{event.reason:02x}",
+                )
                 stats = self._voice_pcm_stats.summary()
                 self._logger.info(
                     "voice PCM summary: frames=%s samples=%s audio_ms=%.0f "
@@ -1071,6 +1160,32 @@ class RC003App:
                     if action is None
                     else self._apply_voice_action(action)
                 )
+                if action is None and self._voice_legacy_transform_key_down:
+                    # The low-level hook can emit the transformed hotkey down
+                    # a few instructions before its app callback marks the
+                    # VoiceController active.  If AUDIO_STOP wins that tiny
+                    # cross-thread race, on_audio_stopped() owes no logical
+                    # KEY_UP even though Windows does.  Close that physical
+                    # edge here as an unconditional final safety net.
+                    try:
+                        win32_input.send_voice_key_combo_up(
+                            self._voice_hotkey_tokens()
+                        )
+                        self._voice_legacy_transform_key_down = False
+                        self._voice_legacy_transform_session = False
+                        self._voice_legacy_transform_emitted = False
+                        self._cancel_hold_watchdog()
+                        self._logger.info(
+                            "voice released transform-down edge at audio stop before controller activation"
+                        )
+                    except (
+                        win32_input.Win32InputUnavailableError,
+                        OSError,
+                    ):
+                        self._logger.exception(
+                            "voice transform-down safety release failed"
+                        )
+                        self._supervisor.request_reconnect()
                 if transformed_session:
                     self._voice_legacy_transform_session = False
                 if action is not None and not action_applied:

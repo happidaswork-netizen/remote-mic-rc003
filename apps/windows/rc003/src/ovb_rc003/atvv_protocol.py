@@ -7,6 +7,12 @@ control opcodes, and IMA/DVI ADPCM tables are interoperability facts (the
 values the physical remote actually speaks), not creative expression; no
 upstream source lines were copied to produce this module.
 
+The ATVV 1.0 AUDIO_EXTEND command, stream-id rules, transfer timeout, and
+start/stop reason values are cross-checked against the Apache-2.0 Android TV
+reference remote implementations:
+https://android.googlesource.com/platform/hardware/google/atv/refDesignRcu/realtek/
+https://android.googlesource.com/platform/hardware/telink/atv/refDesignRcu/
+
 This module is pure Python with no platform dependencies, so it can be unit
 tested on any OS.
 """
@@ -31,6 +37,30 @@ OPCODE_MIC_BUTTON = 0x08
 OPCODE_AUDIO_SYNC = 0x0A
 OPCODE_CAPS = 0x0B
 
+# Host-to-remote ATVV 1.0 commands.  AUDIO_EXTEND is the keepalive that
+# refreshes the remote firmware's finite audio-transfer timer while a long
+# dictation is still active.
+OPCODE_MIC_OPEN = 0x0C
+OPCODE_MIC_CLOSE = 0x0D
+OPCODE_AUDIO_EXTEND = 0x0E
+
+# ATVV 1.0 AUDIO_STOP reason byte values used by the Android TV reference
+# remote firmware.  Unknown vendor-specific values remain visible as hex.
+AUDIO_STOP_REASON_NAMES = {
+    0x00: "mic_close",
+    0x02: "hold_to_talk_released",
+    0x04: "upcoming_audio_start",
+    0x08: "audio_transfer_timeout",
+    0x10: "audio_notifications_disabled",
+    0x80: "other",
+}
+
+AUDIO_START_REASON_NAMES = {
+    0x00: "mic_open",
+    0x01: "press_to_talk",
+    0x03: "hold_to_talk",
+}
+
 DEFAULT_FRAME_SIZE = 120
 SUPPORTED_SAMPLE_RATE_HZ = 16000
 
@@ -49,16 +79,41 @@ def mic_open_command(version: int) -> bytes:
     """Host->device command that opens/starts the microphone stream."""
 
     if version >= 0x0100:
-        return bytes((0x0C, 0x00))
-    return bytes((0x0C, 0x00, 0x00))
+        return bytes((OPCODE_MIC_OPEN, 0x00))
+    return bytes((OPCODE_MIC_OPEN, 0x00, 0x00))
 
 
 def mic_close_command(version: int, session_id: int) -> bytes:
     """Host->device command that closes the microphone stream."""
 
     if version >= 0x0100:
-        return bytes((0x0D, session_id & 0xFF))
-    return bytes((0x0D,))
+        return bytes((OPCODE_MIC_CLOSE, session_id & 0xFF))
+    return bytes((OPCODE_MIC_CLOSE,))
+
+
+def mic_extend_command(version: int, session_id: int) -> Optional[bytes]:
+    """Refresh an active ATVV 1.0 stream's remote-side transfer timer.
+
+    ATVV 0.4 has no EXTEND command, so callers must treat ``None`` as an
+    intentionally unsupported legacy session rather than writing an unknown
+    opcode to the remote.
+    """
+
+    if version < 0x0100:
+        return None
+    return bytes((OPCODE_AUDIO_EXTEND, session_id & 0xFF))
+
+
+def audio_stop_reason_name(reason: Optional[int]) -> str:
+    if reason is None:
+        return "unspecified"
+    return AUDIO_STOP_REASON_NAMES.get(reason, f"unknown_0x{reason:02x}")
+
+
+def audio_start_reason_name(reason: Optional[int]) -> str:
+    if reason is None:
+        return "unspecified"
+    return AUDIO_START_REASON_NAMES.get(reason, f"unknown_0x{reason:02x}")
 
 
 @dataclass(frozen=True)

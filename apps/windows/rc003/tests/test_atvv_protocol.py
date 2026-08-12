@@ -70,6 +70,22 @@ class MicCommandTests(unittest.TestCase):
     def test_mic_close_legacy_has_no_session_byte(self):
         self.assertEqual(proto.mic_close_command(0x0000, 7), bytes((0x0D,)))
 
+    def test_mic_extend_v1_includes_session_id(self):
+        self.assertEqual(proto.mic_extend_command(0x0100, 7), bytes((0x0E, 7)))
+
+    def test_mic_extend_legacy_is_unsupported(self):
+        self.assertIsNone(proto.mic_extend_command(0x0000, 7))
+
+    def test_audio_stop_reason_name_preserves_known_and_unknown_values(self):
+        self.assertEqual(proto.audio_stop_reason_name(0x08), "audio_transfer_timeout")
+        self.assertEqual(proto.audio_stop_reason_name(0x55), "unknown_0x55")
+        self.assertEqual(proto.audio_stop_reason_name(None), "unspecified")
+
+    def test_audio_start_reason_names_cover_atvv_interaction_models(self):
+        self.assertEqual(proto.audio_start_reason_name(0x00), "mic_open")
+        self.assertEqual(proto.audio_start_reason_name(0x01), "press_to_talk")
+        self.assertEqual(proto.audio_start_reason_name(0x03), "hold_to_talk")
+
 
 class ADPCMDecoderTests(unittest.TestCase):
     def test_decoder_starts_at_zero_state(self):

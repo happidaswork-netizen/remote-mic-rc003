@@ -208,6 +208,17 @@ def main() -> None:
 
         flag_index = args.index("--rc003-hid-injector")
         raise SystemExit(frida_compat.injector_main(args[flag_index + 1 :]))
+    if "--doubao-physicalizer-helper" in args:
+        # Hidden UAC child.  It attaches only the exact hash/RVA allow-listed
+        # Doubao callback, never starts BLE/Raw Input/audio, and exits with its
+        # verified parent bridge process.  It must never fall through to the
+        # bridge or settings branches.
+        from . import doubao_elevation_windows
+
+        flag_index = args.index("--doubao-physicalizer-helper")
+        raise SystemExit(
+            doubao_elevation_windows.helper_main(args[flag_index + 1 :])
+        )
     if "--bridge" in args:
         _run_bridge()
         return

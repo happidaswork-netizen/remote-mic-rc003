@@ -206,7 +206,10 @@ VB-CABLE 虚拟音频驱动"卡片会显示 CABLE Input/CABLE Output 两个端�
    也必须选择 `CABLE Output`（如果按上一节配置了 VB-CABLE）。手动测试通过后，
    光标保持在同一个可编辑文本框中，按住遥控器麦克风键说话，检查是否有文字被输入；
    如果手动组合键都无法启动豆包，请先解决豆包快捷键或输入设备配置问题，本程序
-   不能让本来就不工作的豆包输入法变得可用；
+   不能让本来就不工作的豆包输入法变得可用。豆包的 `ImeService.exe` 可能以
+   高于普通桌面程序的权限运行；此时桥接会显示一次 Windows UAC，只启动一个
+   **豆包专用**的小助手。主桥接本身仍保持普通权限；取消 UAC 时普通按键/音频桥
+   仍可运行，但豆包会继续忽略合成的语音快捷键；
 5. 需要时从 Start Menu 选择"停止 Remote Mic · RC003"结束桥接，
    或从"设置 → 应用"/Start Menu 的"卸载"条目卸载（卸载会先自动停止
    正在运行的进程，再删除安装时写入的程序文件）。遇到按键/语音/启动
@@ -282,7 +285,7 @@ Windows 客户端围绕 RC003 使用场景实现，主要功能如下：
 - 对 Windows Raw Input 丢失的 HID usages，可选复用上游的 Frida Gadget WUDFHost tap。该 tap 上报遥控器的**全部键盘 usage**（返回 `0xF1`、音量 `0x80/0x81`、方向/OK/Home/Menu/TV/Power 等），作为所有普通按键的输入旁路：它在独立 socket 线程上 arm，低层键盘钩子零等待匹配并吞掉原生键，只注入一次映射动作，解决一次按键两次触发的问题。只有显式下载并校验 Gadget 后才会启用；Remote Mic 不会自动提权，需要 tap 时用户必须从已明确提升权限的终端启动桥接。
 - 连接 ATVV GATT 服务，协商能力，接收并解码 16 kHz IMA/DVI ADPCM 语音帧。
 - 使用 **PortAudio** 把解码后的语音写入用户明确选择的输出端点（按端点能力输出立体声并复制声道；16 kHz → 48 kHz 有状态连续插值；解码后经 20 Hz 高通 DC 阻挡和 +10 dB 增益）；不会自动使用 Windows 默认设备。
-- 语音快捷键使用带私有标记的虚拟键 `keybd_event`；`DoubaoPhysicalizer` 附加到豆包 `ImeService.exe` 的低层回调，只对该标记事件清除 `LLKHF_INJECTED` / lower-integrity 标志并清空 `dwExtraInfo`，再把右 Alt 事件转交给后续钩子，因此豆包看到的形状与实体右 Alt 一致。默认切换模式为 `ralt+space`，按住模式为 `ralt`；不把 Windows `Win+H` 当作豆包输入法的验收目标。
+- 语音快捷键使用带私有标记的虚拟键 `keybd_event`；`DoubaoPhysicalizer` 附加到豆包 `ImeService.exe` 的低层回调，只对“目标 VK + `LLKHF_INJECTED` + RemoteMic 私有 `dwExtraInfo` 标记”同时匹配的事件清除 injected / lower-integrity 标志并清空 `dwExtraInfo`，其他程序的合成键保持原样。若普通权限无法附加，只提权一个绑定主桥接 PID 的豆包助手，主桥接退出时助手自动卸载；BLE、Raw Input、音频和全局旧键抑制器不提权。默认切换模式为 `ralt+space`，按住模式为 `ralt`；也支持设置页捕获的自定义组合，不把 Windows `Win+H` 当作豆包输入法的验收目标。
 - 提供 RC003 的 13 键映射界面。麦克风键由 ATVV 协议固定处理；电源、返回、音量键在扫描码层直接映射为 Windows 动作。
 - 提供“连接”“按键”“权限”“检查与修复”四个设置页面；诊断页会区分“已检测到”和“需要手动验证”，不会把进程存活伪装成硬件验收通过。
 - 设置窗口使用 PySide6 Essentials + Qt Quick/QML；便携版和安装器都通过 PyInstaller 打包，不要求终端用户另装 Python 或 Qt。**单个 `RemoteMicRC003.exe`**：双击（无参数）或 `--settings` 打开设置窗口，`--bridge` 启动桥接。

@@ -48,6 +48,35 @@ class LegacyKeySuppressorDecisionTests(unittest.TestCase):
         self.assertEqual(event.flags, suppressor.LLKHF_EXTENDED)
         self.assertEqual(event.dwExtraInfo, 0)
 
+    def test_physicalizes_configured_hotkey_vks_not_just_right_alt(self):
+        gate = suppressor.LegacyKeySuppressor(
+            {0x74}, physicalize_vk_codes=(0xA2, 0x5B)
+        )
+        for vk_code in (0xA2, 0x5B):
+            event = suppressor.KBDLLHOOKSTRUCT(
+                vkCode=vk_code,
+                scanCode=0,
+                flags=suppressor.LLKHF_INJECTED,
+                time=123,
+                dwExtraInfo=suppressor.VOICE_EVENT_EXTRA_INFO,
+            )
+            self.assertTrue(gate.physicalize_injected_event(event))
+            self.assertEqual(event.flags, 0)
+            self.assertEqual(event.dwExtraInfo, 0)
+        # The upstream right-Alt is NOT physicalized when a custom hotkey was
+        # configured, and unrelated injected keys stay untouched.
+        for vk_code in (0xA5, 0x48):
+            event = suppressor.KBDLLHOOKSTRUCT(
+                vkCode=vk_code,
+                scanCode=0,
+                flags=suppressor.LLKHF_INJECTED,
+                time=123,
+                dwExtraInfo=suppressor.VOICE_EVENT_EXTRA_INFO,
+            )
+            original = (int(event.flags), int(event.dwExtraInfo))
+            self.assertFalse(gate.physicalize_injected_event(event))
+            self.assertEqual((int(event.flags), int(event.dwExtraInfo)), original)
+
     def test_does_not_physicalize_unmarked_or_other_injected_events(self):
         gate = suppressor.LegacyKeySuppressor({0x74})
         for vk_code, extra_info in (

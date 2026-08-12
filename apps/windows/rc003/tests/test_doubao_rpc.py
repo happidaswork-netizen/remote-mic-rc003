@@ -84,13 +84,29 @@ class DoubaoRpcTests(unittest.TestCase):
 
 
 class DoubaoPhysicalizerTests(unittest.TestCase):
-    def test_script_only_clears_marked_right_alt_in_doubao_callback(self):
-        source = doubao_rpc._PHYSICALIZER_SOURCE
+    def test_script_clears_marker_only_for_configured_hotkey_vks(self):
+        source = doubao_rpc._physicalizer_source((0xA2, 0x5B))
 
-        self.assertIn("vk === 0xA5", source)
+        # Both the modifier and the trigger key of the configured chord get
+        # the injected marker stripped; no right-Alt hardcoding remains.
+        self.assertIn("0xA2", source)
+        self.assertIn("0x5B", source)
+        self.assertNotIn("0xA5", source)
         self.assertIn("flags & 0x10", source)
         self.assertIn("flags & ~0x12", source)
         self.assertIn("event.add(16).writeU64(0)", source)
+        # Unrelated programs' synthetic Ctrl/Win events must remain injected.
+        # Only a RemoteMic-owned event carrying the private marker is altered.
+        self.assertIn("0x524D494352433033", source)
+        self.assertIn("extraInfo.compare(remoteMicMarker) === 0", source)
+
+    def test_script_defaults_to_right_alt(self):
+        source = doubao_rpc._physicalizer_source((0xA5,))
+        self.assertIn("0xA5", source)
+
+    def test_script_uses_the_callback_rva_selected_for_the_verified_build(self):
+        source = doubao_rpc._physicalizer_source((0xA2, 0x5B), 0x744520)
+        self.assertIn("module.base.add(0x744520)", source)
 
     def test_verified_module_requires_the_installed_doubao_path_and_hash(self):
         with mock.patch.object(
@@ -109,6 +125,22 @@ class DoubaoPhysicalizerTests(unittest.TestCase):
                 doubao_rpc.DoubaoPhysicalizer._verify_module(
                     r"C:\Program Files\Other\ImeService.exe"
                 )
+            )
+
+    def test_current_doubao_build_selects_its_own_keyboard_callback(self):
+        current_digest = (
+            "86a863fd2b4be9526ab3cd88a857ba6354b8547e0b39319d950563cad3827435"
+        )
+        with mock.patch.object(
+            doubao_rpc.hashlib,
+            "sha256",
+            return_value=mock.Mock(hexdigest=lambda: current_digest),
+        ), mock.patch.object(doubao_rpc.Path, "read_bytes", return_value=b"current"):
+            self.assertEqual(
+                doubao_rpc.DoubaoPhysicalizer._verified_callback_rva(
+                    r"C:\Program Files\DoubaoIME\ImeService.exe"
+                ),
+                0x744520,
             )
 
     def test_start_attaches_only_after_module_verification(self):
@@ -130,13 +162,17 @@ class DoubaoPhysicalizerTests(unittest.TestCase):
             "_probe_module",
             return_value=r"C:\Program Files\DoubaoIME\ImeService.exe",
         ), mock.patch.object(
-            physicalizer, "_verify_module", return_value=True
+            physicalizer, "_verified_callback_rva", return_value=0x744520
         ):
-            self.assertTrue(physicalizer.start())
+            self.assertTrue(physicalizer.start((0xA2, 0x5B)))
 
         self.assertEqual(physicalizer.status, "active")
         script.load.assert_called_once()
         fake_frida.attach.assert_called_once_with(46500)
+        source = session.create_script.call_args[0][0]
+        self.assertIn("0xA2", source)
+        self.assertIn("0x5B", source)
+        self.assertIn("module.base.add(0x744520)", source)
         physicalizer.stop()
         script.unload.assert_called_once()
         session.detach.assert_called_once()

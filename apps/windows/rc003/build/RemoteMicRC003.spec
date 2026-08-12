@@ -91,6 +91,7 @@ hiddenimports = [
     "ovb_rc003.win32_input",
     "ovb_rc003.connection_supervisor",
     "ovb_rc003.doubao_rpc",
+    "ovb_rc003.doubao_elevation_windows",
     "ovb_rc003.frida_compat",
     "ovb_rc003.frida_hid_tap_runtime",
     "ovb_rc003.frida_hid_tap_injector",

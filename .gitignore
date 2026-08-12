@@ -1,5 +1,8 @@
 .build/
 dist/
+apps/windows/rc003/dist-v*-local/
+apps/windows/rc003/build-v*-local/
+apps/windows/rc003/build/pyinstaller-work-*/
 .venv/
 __pycache__/
 *.pyc
