@@ -305,6 +305,45 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertTrue(self.app._voice.active)
         self.assertTrue(self.app._voice_legacy_transform_session)
 
+    def test_physical_f5_cancels_audio_started_host_fallback(self):
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
+        self.app._voice_audio_started_waiting_for_legacy_f5 = True
+        self.app._voice_legacy_transform_key_down = True
+
+        class PendingFallback:
+            cancelled = False
+
+            def cancel(self):
+                self.cancelled = True
+
+        fallback = PendingFallback()
+        self.app._voice_legacy_f5_timeout = fallback
+        trigger_calls = []
+        original = self.app._handle_mic_button_pressed
+
+        def record_trigger(**kwargs):
+            trigger_calls.append(kwargs)
+            return original(**kwargs)
+
+        self.app._handle_mic_button_pressed = record_trigger
+        try:
+            self.app._on_legacy_key_event(0x74, True)
+            # Simulate a cancelled Timer callback that was already queued. It
+            # must see the cleared latch and remain inert.
+            self.app._legacy_f5_timeout_fire()
+        finally:
+            self.app._handle_mic_button_pressed = original
+
+        self.assertTrue(fallback.cancelled)
+        self.assertIsNone(self.app._voice_legacy_f5_timeout)
+        self.assertFalse(self.app._voice_audio_started_waiting_for_legacy_f5)
+        self.assertEqual(
+            trigger_calls,
+            [{"send_device_open": False, "host_action_handled": True}],
+        )
+        self.assertTrue(self.app._voice.active)
+
     def test_overlapping_mic_press_closes_stuck_session_and_reopens(self):
         self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
         self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")

@@ -638,6 +638,20 @@ class RC003App:
                 if self._legacy_f5_is_down:
                     return
                 self._legacy_f5_is_down = True
+                # AUDIO_STARTED can beat the physical F5 edge and arm the
+                # 0.4-second host fallback.  Once this real edge arrives, the
+                # transformed hotkey already owns activation for this press;
+                # leaving the fallback armed makes it fire a second host
+                # shortcut shortly afterwards.  Clear/cancel it under the
+                # same lock used by the timer callback, then route the F5
+                # normally after releasing the non-reentrant lock.
+                with self._voice_trigger_lock:
+                    if self._voice_audio_started_waiting_for_legacy_f5:
+                        self._voice_audio_started_waiting_for_legacy_f5 = False
+                        self._cancel_legacy_f5_timeout()
+                        self._logger.info(
+                            "voice physical F5 arrived; canceled pending host fallback"
+                        )
                 self._logger.info(
                     "voice legacy F5 trigger received from low-level keyboard hook"
                 )
