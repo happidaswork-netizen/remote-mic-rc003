@@ -23,32 +23,57 @@ from typing import Any, Callable, Optional, Tuple
 DEFAULT_PIPE = r"\\.\pipe\ObricIme\oime-server"
 _RPC_DLL_NAME = "rpc.dll"
 _IME_SERVICE_NAME = "ImeService.exe"
-_IME_SERVICE_CALLBACK_RVA = 0x726740
-_IME_SERVICE_SHA256 = "8c51f6e78953598e75a89574ddb49a0fb78d3fa2bae8229290fcf1706274aedf"
+# The callback is deliberately allow-listed per exact ImeService.exe build.
+# Attaching Frida at a guessed address after Doubao updates would be much more
+# dangerous than declining the optional integration, especially because this
+# callback sits in the global keyboard path.  The second entry is the build
+# shipped on 2026-08-10; its RVA was recovered statically from the
+# SetWindowsHookExW(WH_KEYBOARD_LL, callback, ...) call site.
+_IME_SERVICE_CALLBACK_RVAS = {
+    "8c51f6e78953598e75a89574ddb49a0fb78d3fa2bae8229290fcf1706274aedf": 0x726740,
+    "86a863fd2b4be9526ab3cd88a857ba6354b8547e0b39319d950563cad3827435": 0x744520,
+}
+# Backward-compatible names retained for callers/tests that inspect the
+# original verified build constants.
+_IME_SERVICE_SHA256 = next(iter(_IME_SERVICE_CALLBACK_RVAS))
+_IME_SERVICE_CALLBACK_RVA = _IME_SERVICE_CALLBACK_RVAS[_IME_SERVICE_SHA256]
+# Must match legacy_key_suppressor_windows.VOICE_EVENT_EXTRA_INFO.  Keeping the
+# literal here avoids importing the global-hook module into the elevated
+# helper.  The Frida callback only clears flags on RemoteMic-owned events with
+# this exact marker; unrelated synthetic Ctrl/Win input is left untouched.
+_VOICE_EVENT_EXTRA_INFO = 0x524D494352433033
 
-def _physicalizer_source(vk_codes: Tuple[int, ...]) -> str:
+
+def _physicalizer_source(
+    vk_codes: Tuple[int, ...],
+    callback_rva: int = _IME_SERVICE_CALLBACK_RVA,
+) -> str:
     """Return the Frida script that strips Doubao's injected-event marker.
 
     Doubao ignores Win32 synthetic key events (``LLKHF_INJECTED``).  The
     script hooks ImeService.exe's keyboard callback and clears that marker
     only for the configured voice hotkey's virtual keys, so the injected edge
     looks physical to Doubao.  The callback address, marker offset and module
-    hash match the verified DoubaoIME build (see ``_IME_SERVICE_SHA256``).
+    hash match one exact allow-listed DoubaoIME build (see
+    ``_IME_SERVICE_CALLBACK_RVAS``).
     """
 
     codes_literal = ", ".join(f"0x{int(code):X}" for code in vk_codes)
     return f"""\
 const module = Process.getModuleByName('ImeService.exe');
-const callback = module.base.add(0x726740);
+const callback = module.base.add(0x{int(callback_rva):X});
 send({{type: 'ready', callback: callback.toString()}});
 const targetVks = new Set([{codes_literal}]);
+const remoteMicMarker = uint64('0x{_VOICE_EVENT_EXTRA_INFO:X}');
 Interceptor.attach(callback, {{
   onEnter(args) {{
     if (args[0].toInt32() < 0) return;
     const event = args[2];
     const vk = event.readU32();
     const flags = event.add(8).readU32();
-    if (targetVks.has(vk) && (flags & 0x10) !== 0) {{
+    const extraInfo = event.add(16).readU64();
+    if (targetVks.has(vk) && (flags & 0x10) !== 0 &&
+        extraInfo.compare(remoteMicMarker) === 0) {{
       event.add(8).writeU32(flags & ~0x12);
       event.add(16).writeU64(0);
     }}
@@ -106,17 +131,23 @@ class DoubaoPhysicalizer:
         )
 
     @staticmethod
-    def _verify_module(path: str) -> bool:
+    def _verified_callback_rva(path: str) -> Optional[int]:
         try:
             module_path = Path(path)
             if module_path.name.casefold() != _IME_SERVICE_NAME.casefold():
-                return False
+                return None
             if "doubaoime" not in str(module_path.parent).casefold():
-                return False
+                return None
             digest = hashlib.sha256(module_path.read_bytes()).hexdigest()
         except OSError:
-            return False
-        return digest == _IME_SERVICE_SHA256
+            return None
+        return _IME_SERVICE_CALLBACK_RVAS.get(digest.casefold())
+
+    @staticmethod
+    def _verify_module(path: str) -> bool:
+        """Compatibility predicate for exact, allow-listed Doubao builds."""
+
+        return DoubaoPhysicalizer._verified_callback_rva(path) is not None
 
     def _probe_module(self, session: Any) -> Optional[str]:
         info: dict[str, Any] = {}
@@ -175,11 +206,18 @@ class DoubaoPhysicalizer:
                     try:
                         session = frida.attach(process.pid)
                         module_path = self._probe_module(session)
-                        if not module_path or not self._verify_module(module_path):
+                        callback_rva = (
+                            self._verified_callback_rva(module_path)
+                            if module_path
+                            else None
+                        )
+                        if callback_rva is None:
                             raise RuntimeError(
                                 "ImeService.exe path or SHA-256 does not match the verified build"
                             )
-                        script = session.create_script(_physicalizer_source(vk_codes))
+                        script = session.create_script(
+                            _physicalizer_source(vk_codes, callback_rva)
+                        )
                         script.load()
                         self._frida = frida
                         self._session = session

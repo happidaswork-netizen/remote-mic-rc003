@@ -67,6 +67,7 @@ from . import (
     button_gesture,
     config,
     connection_supervisor,
+    doubao_elevation_windows,
     doubao_rpc,
     frida_compat,
     hid_identity,
@@ -125,7 +126,11 @@ class RC003App:
         # force-releases it after the hotkey has sat idle with no audio and no
         # key-up. Poked by every audio sample so a live session never trips it.
         self._voice_hold_watchdog: Optional[threading.Timer] = None
-        self._hold_watchdog_timeout = 5.0
+        # Once audio stops arriving, a lost F5-up/AudioStopped edge must not
+        # leave Ctrl/Win logically held long enough to lock the user's normal
+        # keyboard. Live speech pokes this timer for every PCM frame, so the
+        # shorter idle timeout does not cap normal dictation duration.
+        self._hold_watchdog_timeout = 1.5
         # Raw Input and the ATVV control channel arrive on different worker
         # threads. Serialize the voice state machine so one physical press
         # cannot race into two host shortcut deliveries.
@@ -270,14 +275,30 @@ class RC003App:
                 self._logger.info(
                     "startup: RC003 F5 voice edge transforms to the configured voice hotkey"
                 )
-                if doubao_rpc.start_physicalizer(self._voice_hotkey_vk_codes()):
+                physicalizer_ready = doubao_rpc.start_physicalizer(
+                    self._voice_hotkey_vk_codes()
+                )
+                if not physicalizer_ready:
+                    self._logger.info(
+                        "startup: requesting narrow administrator approval for "
+                        "the Doubao-only physicalizer helper"
+                    )
+                    physicalizer_ready = (
+                        doubao_elevation_windows.ensure_elevated_physicalizer(
+                            self._voice_hotkey_vk_codes()
+                        )
+                    )
+                if physicalizer_ready:
                     self._logger.info(
                         "startup: Doubao low-level voice event physicalizer enabled"
                     )
                 else:
                     self._logger.warning(
-                        "startup: Doubao voice physicalizer unavailable: %s",
-                        doubao_rpc.physicalizer_error() or doubao_rpc.physicalizer_status(),
+                        "startup: Doubao voice physicalizer unavailable: direct=%s; "
+                        "elevated-helper=%s",
+                        doubao_rpc.physicalizer_error()
+                        or doubao_rpc.physicalizer_status(),
+                        doubao_elevation_windows.elevation_error() or "unavailable",
                     )
         except legacy_key_suppressor_windows.LegacyKeySuppressorUnavailableError as exc:
             self._logger.warning("startup: RC003 voice legacy-key guard unavailable: %s", exc)

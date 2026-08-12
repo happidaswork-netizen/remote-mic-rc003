@@ -114,7 +114,7 @@ class LegacyKeySuppressor:
         on_key_emit: Optional[Callable[[PhysicalKeyTarget, bool], bool]] = None,
         *,
         rc003_vk_codes: Optional[FrozenSet[int]] = None,
-        consume_wait_seconds: float = 0.060,
+        consume_wait_seconds: float = 0.040,
         physicalize_vk_codes: Iterable[int] = (0xA5,),
     ) -> None:
         self._suppress_vk_codes: FrozenSet[int] = frozenset(int(vk) for vk in suppress_vk_codes)
@@ -125,6 +125,11 @@ class LegacyKeySuppressor:
         # them. Upstream defaulted to right-Alt, the built-in HOLD preset.
         self._physicalize_vk_codes: FrozenSet[int] = frozenset(
             int(vk) for vk in physicalize_vk_codes
+        )
+        _logger.debug(
+            "physicalize_vk_codes=%s suppress_vk_codes=%s",
+            sorted(self._physicalize_vk_codes),
+            sorted(self._suppress_vk_codes),
         )
         self._on_key_event = on_key_event
         self._on_key_transform = on_key_transform
@@ -141,9 +146,11 @@ class LegacyKeySuppressor:
         )
         # The hook callback runs synchronously ahead of the Raw Input message
         # loop for the same physical press, so the arming edge can land up to
-        # a few tens of milliseconds later (measured ~17ms on the RC003). The
-        # upstream reference uses 0.06s for its correlated back/volume edges;
-        # use the same conservative window for the RC003 key set.
+        # a few milliseconds later (measured ~17ms on the RC003). Keep a small
+        # margin for a loaded machine and a known 30ms late-arrival boundary,
+        # but never stall a real keyboard's Enter/arrow edge for the old 60ms
+        # window. This callback is in the global input path and must remain
+        # unobtrusive while the bridge is resident.
         self._consume_wait_seconds = max(0.0, float(consume_wait_seconds))
         self._armed_events: List[_ArmedKeyEvent] = []
         self._armed_events_lock = threading.Lock()
@@ -290,7 +297,7 @@ class LegacyKeySuppressor:
                 )
                 if matched or now >= deadline:
                     elapsed = now - deadline + effective_wait
-                    _logger.info(
+                    _logger.debug(
                         "consume key edge: vk=0x%X scan=0x%X ext=%s pressed=%s "
                         "matched=%s armed=%d waited=%.3fs thread=%s",
                         int(vk_code),
@@ -514,6 +521,13 @@ class LegacyKeySuppressor:
             original_flags = int(event.flags)
             original_extra_info = int(event.dwExtraInfo)
             if self.physicalize_injected_event(event):
+                _logger.debug(
+                    "physicalized vk=0x%X msg=0x%X flags 0x%X->0x%X",
+                    int(event.vkCode),
+                    int(w_param),
+                    original_flags,
+                    int(event.flags),
+                )
                 try:
                     return user32.CallNextHookEx(
                         self._hook, n_code, w_param, int(l_param)

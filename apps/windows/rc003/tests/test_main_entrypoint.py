@@ -13,7 +13,14 @@ import sys
 import unittest
 
 from ovb_rc003 import __main__ as main_module
-from ovb_rc003 import app, config, device_catalog, single_instance, windows_diagnostics
+from ovb_rc003 import (
+    app,
+    config,
+    device_catalog,
+    doubao_elevation_windows,
+    single_instance,
+    windows_diagnostics,
+)
 
 
 def _make_guard_class(*, raise_on_enter=None, enter_calls=None):
@@ -43,6 +50,7 @@ class _ArgvRestoringTestCase(unittest.TestCase):
         self._original_app_main = app.main
         self._original_notice = single_instance.show_bridge_startup_blocked_notice
         self._original_load_config = config.load_config
+        self._original_doubao_helper_main = doubao_elevation_windows.helper_main
         # XRBM-023: default every test in this suite to a safe no-op stub for
         # the visible-notice callable. show_bridge_startup_blocked_notice's
         # real implementation opens a real, SYSTEMMODAL Win32 MessageBoxW -
@@ -63,6 +71,7 @@ class _ArgvRestoringTestCase(unittest.TestCase):
         app.main = self._original_app_main
         single_instance.show_bridge_startup_blocked_notice = self._original_notice
         config.load_config = self._original_load_config
+        doubao_elevation_windows.helper_main = self._original_doubao_helper_main
 
 
 class BridgeModeRoutingTests(_ArgvRestoringTestCase):
@@ -229,6 +238,27 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
     guard for everything except --bridge - none of them may even construct
     it, let alone touch the mutex.
     """
+
+    def test_hidden_doubao_helper_never_starts_bridge_or_settings(self):
+        calls = []
+        doubao_elevation_windows.helper_main = lambda args: calls.append(args) or 7
+        app.main = lambda: self.fail("the Doubao helper must never start the bridge")
+        enter_calls = []
+        single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=enter_calls)
+        sys.argv = [
+            "ovb_rc003",
+            doubao_elevation_windows.HELPER_FLAG,
+            "123",
+            "a" * 32,
+            "A2,5B",
+        ]
+
+        with self.assertRaises(SystemExit) as ctx:
+            main_module.main()
+
+        self.assertEqual(ctx.exception.code, 7)
+        self.assertEqual(calls, [["123", "a" * 32, "A2,5B"]])
+        self.assertEqual(enter_calls, [])
 
     def test_no_arguments_opens_settings_and_never_touches_the_guard(self):
         from ovb_rc003 import settings_ui
