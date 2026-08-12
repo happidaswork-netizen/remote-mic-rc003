@@ -92,9 +92,10 @@ class ATVVSessionControlEventTests(unittest.TestCase):
 
     def test_audio_start_event_carries_session_id(self):
         session = atvv_session.ATVVSession()
-        event = session.handle_control(bytes((proto.OPCODE_AUDIO_START, 0, 0, 42)))
+        event = session.handle_control(bytes((proto.OPCODE_AUDIO_START, 3, 0, 42)))
         self.assertIsInstance(event, atvv_session.AudioStarted)
         self.assertEqual(event.session_id, 42)
+        self.assertEqual(event.reason, 3)
         self.assertTrue(session.mic_open)
 
     def test_audio_start_without_session_id_byte(self):
@@ -105,8 +106,9 @@ class ATVVSessionControlEventTests(unittest.TestCase):
     def test_audio_stop_event_closes_mic(self):
         session = atvv_session.ATVVSession()
         session.handle_control(bytes((proto.OPCODE_AUDIO_START, 0, 0, 1)))
-        event = session.handle_control(bytes((proto.OPCODE_AUDIO_STOP,)))
+        event = session.handle_control(bytes((proto.OPCODE_AUDIO_STOP, 0x08)))
         self.assertIsInstance(event, atvv_session.AudioStopped)
+        self.assertEqual(event.reason, 0x08)
         self.assertFalse(session.mic_open)
 
     def test_unknown_opcode_returns_unknown_control_without_raising(self):
@@ -178,6 +180,7 @@ class ATVVSessionAudioTests(unittest.TestCase):
         self.assertEqual(session.mic_open_command(), bytes((0x0C, 0x00)))
         session.handle_control(bytes((proto.OPCODE_AUDIO_START, 0, 0, 9)))
         self.assertEqual(session.mic_close_command(), bytes((0x0D, 9)))
+        self.assertEqual(session.mic_extend_command(), bytes((0x0E, 9)))
 
 
 class DCHighPassFilterTests(unittest.TestCase):

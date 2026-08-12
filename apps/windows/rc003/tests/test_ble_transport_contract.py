@@ -34,6 +34,7 @@ import uuid
 
 from ovb_rc003 import atvv_protocol as proto
 from ovb_rc003 import atvv_session
+from ovb_rc003 import ble_transport_winrt as transport_module
 from ovb_rc003 import identity
 from ovb_rc003.ble_transport_winrt import RC003BleSession, discover_candidates
 
@@ -316,6 +317,7 @@ class SendMicOpenThreadsafeTests(unittest.TestCase):
 
         _run(scenario())
 
+
     def test_closing_gate_drops_a_write_scheduled_after_close_started(self):
         env = FakeWinRTEnvironment()
 
@@ -377,6 +379,56 @@ class SendMicOpenThreadsafeTests(unittest.TestCase):
             await session.close()
 
         _run(scenario())
+
+
+class AudioStreamKeepaliveTests(unittest.TestCase):
+    def test_audio_start_sends_periodic_extend_and_audio_stop_cancels_it(self):
+        env = FakeWinRTEnvironment()
+        original_interval = transport_module._MIC_EXTEND_INTERVAL_SECONDS
+        transport_module._MIC_EXTEND_INTERVAL_SECONDS = 0.02
+
+        async def scenario():
+            winrt = env.build_winrt_modules()
+            session = RC003BleSession(
+                on_pcm_frame=lambda samples: None,
+                winrt=winrt,
+                loop=asyncio.get_event_loop(),
+            )
+            candidate = identity.RC003Candidate(
+                name=env.name, hardware_match=False, handle=env.discovered_info
+            )
+            await session.connect(candidate)
+            env.control_characteristic.fire(_caps_payload())
+            env.control_characteristic.fire(
+                bytes((proto.OPCODE_AUDIO_START, 0x03, 0x02, 9))
+            )
+            extend = bytes((proto.OPCODE_AUDIO_EXTEND, 9))
+            self.assertTrue(
+                await _async_wait_until(
+                    lambda: extend in env.tx_characteristic.write_history
+                )
+            )
+
+            env.control_characteristic.fire(
+                bytes((proto.OPCODE_AUDIO_STOP, 0x02))
+            )
+            self.assertTrue(
+                await _async_wait_until(lambda: not session.session.mic_open)
+            )
+            await asyncio.sleep(0.03)
+            writes_after_stop = env.tx_characteristic.write_history.count(extend)
+            await asyncio.sleep(0.08)
+            self.assertEqual(
+                env.tx_characteristic.write_history.count(extend),
+                writes_after_stop,
+            )
+            await session.close()
+            self.assertIsNone(session._mic_keepalive_task)
+
+        try:
+            _run(scenario())
+        finally:
+            transport_module._MIC_EXTEND_INTERVAL_SECONDS = original_interval
 
 
 class CloseCancelsInFlightMicOpenTests(unittest.TestCase):

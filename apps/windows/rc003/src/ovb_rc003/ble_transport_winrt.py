@@ -87,6 +87,7 @@ already-torn-down session can never be processed after a reconnect.
 from __future__ import annotations
 
 import asyncio
+import logging
 import queue
 import threading
 import uuid
@@ -104,6 +105,9 @@ DisconnectedCallback = Callable[[], None]
 
 _QUEUE_MAXSIZE = 64
 _WORKER_POLL_SECONDS = 0.2
+_MIC_EXTEND_INTERVAL_SECONDS = 5.0
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class WinRTUnavailableError(Exception):
@@ -244,6 +248,10 @@ class RC003BleSession:
         # touching GATT resources (XRBM-018 RETRY 1 P1 #3) - see
         # _cancel_pending_mic_open_writes().
         self._mic_open_tasks: "set[asyncio.Task]" = set()
+        # ATVV 1.0 remotes stop audio when their finite transfer timer is not
+        # refreshed.  One loop is owned by this BLE connection and cancelled
+        # before teardown, so no stale EXTEND can land on a later generation.
+        self._mic_keepalive_task: Optional["asyncio.Task"] = None
 
     @property
     def session(self) -> atvv_session.ATVVSession:
@@ -419,6 +427,95 @@ class RC003BleSession:
                 pass
         self._mic_open_tasks.clear()
 
+    def _start_mic_keepalive_threadsafe(self) -> None:
+        # A few contract tests intentionally close their short-lived owner
+        # loop immediately after connect() and then exercise worker decoding.
+        # There is nowhere safe to schedule a GATT write in that artificial
+        # state; production keeps the owner loop alive for the connection.
+        if self._loop.is_closed():
+            return
+        generation = self._generation
+
+        def _schedule() -> None:
+            if (
+                self._closing
+                or generation != self._generation
+                or not self._session.mic_open
+                or self._session.mic_extend_command() is None
+            ):
+                return
+            prior = self._mic_keepalive_task
+            if prior is not None and not prior.done():
+                prior.cancel()
+            task = asyncio.ensure_future(self._mic_keepalive_loop(generation))
+            self._mic_keepalive_task = task
+            task.add_done_callback(
+                lambda finished: self._on_mic_keepalive_done(finished, generation)
+            )
+
+        self._loop.call_soon_threadsafe(_schedule)
+
+    async def _mic_keepalive_loop(self, generation: int) -> None:
+        while True:
+            await asyncio.sleep(_MIC_EXTEND_INTERVAL_SECONDS)
+            if (
+                self._closing
+                or generation != self._generation
+                or not self._session.mic_open
+            ):
+                return
+            command = self._session.mic_extend_command()
+            if command is None:
+                return
+            await self._write_tx(command)
+            _LOGGER.info(
+                "ATVV audio stream keepalive sent: stream_id=%s interval=%.0fs",
+                command[1],
+                _MIC_EXTEND_INTERVAL_SECONDS,
+            )
+
+    def _on_mic_keepalive_done(
+        self, task: "asyncio.Task", generation: int
+    ) -> None:
+        if self._mic_keepalive_task is task:
+            self._mic_keepalive_task = None
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        if self._closing or generation != self._generation:
+            return
+        if self._on_error is not None:
+            self._on_error(exc)
+
+    def _stop_mic_keepalive_threadsafe(self) -> None:
+        if self._loop.is_closed():
+            return
+        generation = self._generation
+
+        def _cancel() -> None:
+            if generation != self._generation:
+                return
+            task = self._mic_keepalive_task
+            if task is not None and not task.done():
+                task.cancel()
+
+        self._loop.call_soon_threadsafe(_cancel)
+
+    async def _cancel_mic_keepalive(self) -> None:
+        task = self._mic_keepalive_task
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        if self._mic_keepalive_task is task:
+            self._mic_keepalive_task = None
+
     # -- notification callbacks: non-blocking enqueue only -----------------
 
     def _handle_control_notification(self, _sender, args) -> None:
@@ -484,6 +581,10 @@ class RC003BleSession:
             if self._on_error is not None:
                 self._on_error(exc)
             return
+        if isinstance(event, atvv_session.AudioStarted):
+            self._start_mic_keepalive_threadsafe()
+        elif isinstance(event, atvv_session.AudioStopped):
+            self._stop_mic_keepalive_threadsafe()
         if self._on_control_event is not None:
             self._on_control_event(event)
 
@@ -515,6 +616,7 @@ class RC003BleSession:
         # this coroutine runs on) so any send_mic_open_threadsafe() callback
         # already queued via call_soon_threadsafe sees it the moment it runs.
         self._closing = True
+        await self._cancel_mic_keepalive()
         # Then, before anything else touches GATT resources: cancel/await
         # any MIC_OPEN write that is already in flight (XRBM-018 RETRY 1 P1
         # #3) - closing the gate above only stops *new* writes from being
